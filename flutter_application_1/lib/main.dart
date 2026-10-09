@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
+import 'column_mapping_page.dart';
 import 'gtfs_data.dart';
 import 'poster_service.dart';
 
@@ -80,6 +83,7 @@ class _TransitHomePageState extends State<TransitHomePage> {
   TransitStop? _selectedStop;
   TransitRoute? _selectedRoute;
   bool _isLoading = false;
+  bool _isGeneratingPoster = false;
 
   Future<void> _importFeed() async {
     try {
@@ -95,7 +99,24 @@ class _TransitHomePageState extends State<TransitHomePage> {
         throw const FormatException('The selected ZIP file could not be read.');
       }
       setState(() => _isLoading = true);
-      final dataset = await GtfsDataset.fromZip(bytes, sourceName: file.name);
+      final preview = await GtfsDataset.inspectZip(bytes);
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+      final columnMappings = await Navigator.of(context).push<GtfsColumnMappings>(
+        MaterialPageRoute(
+          builder: (context) => GtfsColumnMappingPage(
+            sourceName: file.name,
+            headersByFile: preview.headersByFile,
+          ),
+        ),
+      );
+      if (!mounted || columnMappings == null) return;
+      setState(() => _isLoading = true);
+      final dataset = await GtfsDataset.fromZip(
+        bytes,
+        sourceName: file.name,
+        columnMappings: columnMappings,
+      );
       if (!mounted) return;
       setState(() {
         _dataset = dataset;
@@ -129,15 +150,50 @@ class _TransitHomePageState extends State<TransitHomePage> {
   }
 
   Future<void> _printStop(GtfsDataset dataset, TransitStop stop) async {
+    if (_isGeneratingPoster) return;
     try {
       final routeIds = dataset.routeIdsByStopId[stop.id] ?? const <String>[];
       final routes = dataset.routes
           .where((route) => routeIds.contains(route.id))
           .toList();
-      await PosterService.printStop(
-        stop: stop,
-        routes: routes,
-        agencyName: dataset.agencyName,
+      final layout = await showDialog<StopPosterLayout>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Stop poster layout'),
+          content: const Text(
+            'Choose whether routes share a continuous guide or start on '
+            'separate A4 pages. Each route keeps its own stop sequence.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            OutlinedButton(
+              onPressed: () => Navigator.of(
+                context,
+              ).pop(StopPosterLayout.combined),
+              child: const Text('Combined routes'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(
+                context,
+              ).pop(StopPosterLayout.separateRoutes),
+              child: const Text('Separate by route'),
+            ),
+          ],
+        ),
+      );
+      if (layout == null || !mounted) return;
+      await _runWithPosterProgress(
+        (onPdfGenerated) => PosterService.printStop(
+          stop: stop,
+          routes: routes,
+          allStops: dataset.stops,
+          agencyName: dataset.agencyName,
+          layout: layout,
+          onPdfGenerated: onPdfGenerated,
+        ),
       );
     } catch (error) {
       if (mounted) {
@@ -147,21 +203,63 @@ class _TransitHomePageState extends State<TransitHomePage> {
   }
 
   Future<void> _printRoute(GtfsDataset dataset, TransitRoute route) async {
+    if (_isGeneratingPoster) return;
     try {
-      final stops = route.stopIds
-          .map((id) => dataset.stops.where((stop) => stop.id == id))
-          .where((matches) => matches.isNotEmpty)
-          .map((matches) => matches.first)
-          .toList();
-      await PosterService.printRoute(
-        route: route,
-        stops: stops,
-        agencyName: dataset.agencyName,
+      await _runWithPosterProgress(
+        (onPdfGenerated) => PosterService.printRoute(
+          route: route,
+          allStops: dataset.stops,
+          agencyName: dataset.agencyName,
+          onPdfGenerated: onPdfGenerated,
+        ),
       );
     } catch (error) {
       if (mounted) {
         _showMessage('Could not create route poster: $error', isError: true);
       }
+    }
+  }
+
+  Future<void> _runWithPosterProgress(
+    Future<void> Function(Future<void> Function()) generateAndPrint,
+  ) async {
+    setState(() => _isGeneratingPoster = true);
+    var progressDialogOpen = true;
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => const PopScope(
+          canPop: false,
+          child: AlertDialog(
+            content: Row(
+              children: [
+                SizedBox.square(
+                  dimension: 22,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+                SizedBox(width: 16),
+                Expanded(child: Text('Generating poster PDF…')),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    try {
+      await generateAndPrint(() async {
+        if (!progressDialogOpen || !mounted) return;
+        progressDialogOpen = false;
+        Navigator.of(context, rootNavigator: true).pop();
+        await Future<void>.delayed(Duration.zero);
+      });
+    } finally {
+      if (progressDialogOpen && mounted) {
+        progressDialogOpen = false;
+        Navigator.of(context, rootNavigator: true).pop();
+      }
+      if (mounted) setState(() => _isGeneratingPoster = false);
     }
   }
 
@@ -1129,11 +1227,21 @@ class _RouteDetails extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final stops = route.stopIds
-        .map((id) => dataset.stops.where((stop) => stop.id == id))
-        .where((matches) => matches.isNotEmpty)
-        .map((matches) => matches.first)
-        .toList();
+    final stopsById = {for (final stop in dataset.stops) stop.id: stop};
+    final stopSequences = route.stopSequences.isEmpty
+        ? [
+            [
+              for (final stopId in route.stopIds)
+                if (stopsById[stopId] case final stop?) stop,
+            ],
+          ]
+        : [
+            for (final sequence in route.stopSequences)
+              [
+                for (final stopId in sequence.stopIds)
+                  if (stopsById[stopId] case final stop?) stop,
+              ],
+          ];
     final firstStops = dataset.stops.where(
       (stop) => stop.id == route.firstStopId,
     );
@@ -1155,7 +1263,7 @@ class _RouteDetails extends StatelessWidget {
             child: LayoutBuilder(
               builder: (context, constraints) {
                 final narrow = constraints.maxWidth < 540;
-                final stopsPanel = _StopsPanel(stops: stops);
+                final stopsPanel = _StopsPanel(stopSequences: stopSequences);
                 final departuresPanel = _DeparturesPanel(
                   route: route,
                   firstStopName: firstStopName,
@@ -1191,102 +1299,157 @@ class _RouteDetails extends StatelessWidget {
 }
 
 class _StopsPanel extends StatelessWidget {
-  const _StopsPanel({required this.stops});
+  const _StopsPanel({required this.stopSequences});
 
-  final List<TransitStop> stops;
+  final List<List<TransitStop>> stopSequences;
 
   @override
   Widget build(BuildContext context) {
+    final count = stopSequences.fold<int>(
+      0,
+      (total, sequence) => total + sequence.length,
+    );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _PanelHeading(title: 'Stops along this route', count: stops.length),
+        _PanelHeading(title: 'Stops by direction', count: count),
         const SizedBox(height: 12),
         Expanded(
-          child: stops.isEmpty
+          child: stopSequences.every((sequence) => sequence.isEmpty)
               ? const _InlineEmpty(
                   message: 'No stops are listed for this route.',
                 )
-              : ListView.builder(
-                  itemCount: stops.length,
-                  itemBuilder: (context, index) => Padding(
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        SizedBox(
-                          width: 30,
-                          child: Column(
-                            children: [
-                              Container(
-                                width: 25,
-                                height: 25,
-                                alignment: Alignment.center,
-                                decoration: BoxDecoration(
-                                  color: index == 0
-                                      ? const Color(0xFF23785C)
-                                      : const Color(0xFFEAF0ED),
-                                  shape: BoxShape.circle,
-                                ),
-                                child: Text(
-                                  '${index + 1}',
-                                  style: TextStyle(
-                                    color: index == 0
-                                        ? Colors.white
-                                        : const Color(0xFF61747D),
-                                    fontSize: 10,
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
-                              ),
-                              if (index != stops.length - 1)
-                                Container(
-                                  margin: const EdgeInsets.only(top: 3),
-                                  width: 1,
-                                  height: 13,
-                                  color: const Color(0xFFDDE5E1),
-                                ),
-                            ],
+              : ListView(
+                  children: [
+                    for (
+                      var sequenceIndex = 0;
+                      sequenceIndex < stopSequences.length;
+                      sequenceIndex++
+                    ) ...[
+                      if (stopSequences.length > 1)
+                        Padding(
+                          padding: const EdgeInsets.only(
+                            top: 5,
+                            bottom: 10,
                           ),
-                        ),
-                        const SizedBox(width: 9),
-                        Expanded(
-                          child: Padding(
-                            padding: const EdgeInsets.only(top: 4),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  stops[index].name,
-                                  style: const TextStyle(
-                                    color: Color(0xFF173442),
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                                if (stops[index].code.isNotEmpty)
-                                  Padding(
-                                    padding: const EdgeInsets.only(top: 2),
-                                    child: Text(
-                                      'Code ${stops[index].code}',
-                                      style: const TextStyle(
-                                        color: Color(0xFF81918D),
-                                        fontSize: 9,
-                                      ),
-                                    ),
-                                  ),
-                              ],
+                          child: Text(
+                            '${stopSequences[sequenceIndex].first.name} → '
+                            '${stopSequences[sequenceIndex].last.name}',
+                            style: const TextStyle(
+                              color: Color(0xFF61747D),
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
                             ),
                           ),
                         ),
-                      ],
-                    ),
-                  ),
+                      for (
+                        var index = 0;
+                        index < stopSequences[sequenceIndex].length;
+                        index++
+                      )
+                        _stopRow(
+                          stopSequences[sequenceIndex][index],
+                          index: index,
+                          isLast:
+                              index ==
+                              stopSequences[sequenceIndex].length - 1,
+                        ),
+                      if (sequenceIndex < stopSequences.length - 1)
+                        const Divider(height: 22),
+                    ],
+                  ],
                 ),
         ),
       ],
     );
   }
+
+  Widget _stopRow(
+    TransitStop stop, {
+    required int index,
+    required bool isLast,
+  }) => Padding(
+    padding: const EdgeInsets.only(bottom: 10),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 30,
+          child: Column(
+            children: [
+              Container(
+                width: 25,
+                height: 25,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: index == 0
+                      ? const Color(0xFF23785C)
+                      : const Color(0xFFEAF0ED),
+                  shape: BoxShape.circle,
+                ),
+                child: Text(
+                  '${index + 1}',
+                  style: TextStyle(
+                    color: index == 0
+                        ? Colors.white
+                        : const Color(0xFF61747D),
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              if (!isLast)
+                Container(
+                  margin: const EdgeInsets.only(top: 3),
+                  width: 1,
+                  height: 13,
+                  color: const Color(0xFFDDE5E1),
+                ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 9),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  stop.name,
+                  style: const TextStyle(
+                    color: Color(0xFF173442),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (stop.code.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                      'Code ${stop.code}',
+                      style: const TextStyle(
+                        color: Color(0xFF81918D),
+                        fontSize: 9,
+                      ),
+                    ),
+                  ),
+                if (isLast)
+                  const Text(
+                    'LAST STOP',
+                    style: TextStyle(
+                      color: Color(0xFF81918D),
+                      fontSize: 8,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 class _DeparturesPanel extends StatelessWidget {
@@ -1329,7 +1492,8 @@ class _DeparturesPanel extends StatelessWidget {
             Padding(
               padding: const EdgeInsets.only(bottom: 7),
               child: Text(
-                'Service ID · ${service.key}',
+                route.serviceDaysByServiceId[service.key] ??
+                    'Service ID · ${service.key}',
                 style: const TextStyle(
                   color: Color(0xFF526777),
                   fontSize: 10,

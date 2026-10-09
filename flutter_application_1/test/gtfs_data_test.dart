@@ -43,6 +43,97 @@ void main() {
     expect(dataset.routeIdsByStopId['s2'], ['r1']);
   });
 
+  test('maps renamed feed columns to the fields used by the app', () {
+    final renamedFiles = {
+      'routes.txt':
+          'line_key,line_label,line_type\r\n'
+          'r1,Harbour Line,3\r\n',
+      'stops.txt':
+          'station_key,station_label,platform_code\r\n'
+          's1,Central Station,C1\r\n'
+          's2,Market Street,M2\r\n',
+      'trips.txt':
+          'line_key,calendar_key,journey_key\r\n'
+          'r1,weekday,t1\r\n',
+      'stop_times.txt':
+          'journey_key,station_key,order_num,leave_at\r\n'
+          't1,s1,1,08:00:00\r\n'
+          't1,s2,2,08:10:00\r\n',
+    };
+    const columnMappings = <String, Map<String, int>>{
+      'routes.txt': {'route_id': 0, 'route_short_name': 1, 'route_type': 2},
+      'stops.txt': {'stop_id': 0, 'stop_name': 1, 'stop_code': 2},
+      'trips.txt': {'route_id': 0, 'service_id': 1, 'trip_id': 2},
+      'stop_times.txt': {
+        'trip_id': 0,
+        'stop_id': 1,
+        'stop_sequence': 2,
+        'departure_time': 3,
+      },
+    };
+
+    final dataset = GtfsDataset.fromFiles(
+      renamedFiles,
+      sourceName: 'renamed-columns.zip',
+      columnMappings: columnMappings,
+    );
+
+    expect(dataset.routes.single.displayName, 'Harbour Line');
+    expect(dataset.routes.single.stopIds, ['s1', 's2']);
+    expect(dataset.routes.single.departureTimes, ['08:00:00']);
+    expect(dataset.stops.first.code, 'C1');
+  });
+
+  test('parses LF-delimited GTFS files', () {
+    final lfFiles = {
+      for (final entry in files.entries)
+        entry.key: entry.value.replaceAll('\r\n', '\n'),
+    };
+
+    final dataset = GtfsDataset.fromFiles(lfFiles, sourceName: 'lf-feed.zip');
+
+    expect(dataset.stops, hasLength(2));
+    expect(dataset.routes.single.stopIds, ['s1', 's2']);
+    expect(dataset.routes.single.departureTimes, ['08:01:00', '09:00:00']);
+  });
+
+  test('maps columns by position when headers repeat or are blank', () {
+    final unusualFiles = {
+      'routes.txt':
+          'route_id,route_short_name,route_type,,extra,extra\r\n'
+          'r1,7,3,,unused,also-unused\r\n',
+      'stops.txt':
+          'stop_id,stop_name,,extra\r\n'
+          's1,Central,,unused\r\n',
+      'trips.txt':
+          'route_id,service_id,trip_id,extra\r\n'
+          'r1,weekday,t1,unused\r\n',
+      'stop_times.txt':
+          'trip_id,stop_id,stop_sequence,departure_time,,extra\r\n'
+          't1,s1,1,08:00:00,,unused\r\n',
+    };
+    const columnMappings = <String, Map<String, int>>{
+      'routes.txt': {'route_id': 0, 'route_short_name': 1, 'route_type': 2},
+      'stops.txt': {'stop_id': 0, 'stop_name': 1},
+      'trips.txt': {'route_id': 0, 'service_id': 1, 'trip_id': 2},
+      'stop_times.txt': {
+        'trip_id': 0,
+        'stop_id': 1,
+        'stop_sequence': 2,
+        'departure_time': 3,
+      },
+    };
+
+    final dataset = GtfsDataset.fromFiles(
+      unusualFiles,
+      sourceName: 'extra-columns.zip',
+      columnMappings: columnMappings,
+    );
+
+    expect(dataset.stops.single.name, 'Central');
+    expect(dataset.routes.single.departureTimes, ['08:00:00']);
+  });
+
   test('orders stops using the most common trip direction sequence', () {
     final directionalFiles = {
       ...files,
@@ -72,6 +163,22 @@ void main() {
 
     expect(dataset.routes.single.stopIds, ['z', 'a']);
     expect(dataset.routes.single.firstStopId, 'z');
+    expect(dataset.routes.single.stopIds.last, 'a');
+    expect(
+      dataset.routes.single.stopSequences
+          .map((sequence) => sequence.stopIds)
+          .toList(),
+      [
+        ['z', 'a'],
+        ['a', 'z'],
+      ],
+    );
+    expect(
+      dataset.routes.single.stopSequences
+          .map((sequence) => sequence.tripCount)
+          .toList(),
+      [2, 1],
+    );
   });
 
   test(
@@ -111,6 +218,7 @@ void main() {
         '10:00:00',
         '10:10:00',
         '10:20:00',
+        '10:30:00',
       ]);
       expect(dataset.routes.single.hasEstimatedFrequencyDepartures, isTrue);
     },
@@ -133,6 +241,10 @@ void main() {
           'trip_id,start_time,end_time,headway_secs,exact_times\r\n'
           'weekday-trip,08:00:00,08:31:00,600,1\r\n'
           'weekend-trip,09:00:00,09:21:00,600,1\r\n',
+      'calendar.txt':
+          'service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday\r\n'
+          'weekday,1,1,1,1,1,0,0\r\n'
+          'weekend,0,0,0,0,0,1,1\r\n',
     };
 
     final dataset = GtfsDataset.fromFiles(
@@ -144,9 +256,19 @@ void main() {
       'weekday': ['08:00:00', '08:10:00', '08:20:00', '08:30:00'],
       'weekend': ['09:00:00', '09:10:00', '09:20:00'],
     });
+    expect(dataset.routes.single.serviceDaysByServiceId, {
+      'weekday': 'Monday to Friday',
+      'weekend': 'Saturday and Sunday',
+    });
   });
 
-  test('frequency end time is exclusive and supports times after midnight', () {
+  test('falls back to service ID without calendar.txt', () {
+    final dataset = GtfsDataset.fromFiles(files, sourceName: 'no-calendar.zip');
+
+    expect(dataset.routes.single.serviceDaysByServiceId, isEmpty);
+  });
+
+  test('includes a headway-aligned frequency end time after midnight', () {
     final overnightFiles = {
       ...files,
       'trips.txt': 'route_id,service_id,trip_id\r\nr1,weekday,overnight\r\n',
@@ -169,6 +291,7 @@ void main() {
       '24:00:00',
       '24:10:00',
       '24:20:00',
+      '24:30:00',
     ]);
   });
 
@@ -265,12 +388,20 @@ void main() {
     final bytes = ZipEncoder().encode(archive);
 
     final dataset = await GtfsDataset.fromZip(bytes, sourceName: 'nested.zip');
+    final preview = await GtfsDataset.inspectZip(bytes);
 
     expect(dataset.sourceName, 'nested.zip');
+    expect(preview.headersByFile['routes.txt'], [
+      'route_id',
+      'route_short_name',
+      'route_long_name',
+      'route_type',
+    ]);
     expect(dataset.stops, hasLength(2));
     expect(dataset.routes.single.departureTimes, [
       '08:01:00',
       '08:11:00',
+      '08:21:00',
       '09:00:00',
     ]);
   });

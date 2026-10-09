@@ -2,6 +2,15 @@ import 'dart:convert';
 
 import 'package:archive/archive.dart';
 import 'package:csv/csv.dart';
+import 'package:flutter/foundation.dart';
+
+typedef GtfsColumnMappings = Map<String, Map<String, int>>;
+
+class GtfsFeedPreview {
+  const GtfsFeedPreview(this.headersByFile);
+
+  final Map<String, List<String>> headersByFile;
+}
 
 class TransitStop {
   const TransitStop({
@@ -21,6 +30,20 @@ class TransitStop {
   final double? longitude;
 }
 
+class RouteStopSequence {
+  const RouteStopSequence({
+    required this.startStopId,
+    required this.endStopId,
+    required this.stopIds,
+    this.tripCount = 1,
+  });
+
+  final String startStopId;
+  final String endStopId;
+  final List<String> stopIds;
+  final int tripCount;
+}
+
 class TransitRoute {
   const TransitRoute({
     required this.id,
@@ -28,8 +51,10 @@ class TransitRoute {
     required this.longName,
     required this.type,
     required this.stopIds,
+    required this.stopSequences,
     required this.firstStopId,
     required this.departureTimesByServiceId,
+    required this.serviceDaysByServiceId,
     required this.hasEstimatedFrequencyDepartures,
     required this.hasFrequencyTripsWithoutStopTimes,
     this.description = '',
@@ -45,8 +70,10 @@ class TransitRoute {
   final String? color;
   final String? textColor;
   final List<String> stopIds;
+  final List<RouteStopSequence> stopSequences;
   final String firstStopId;
   final Map<String, List<String>> departureTimesByServiceId;
+  final Map<String, String> serviceDaysByServiceId;
   final bool hasEstimatedFrequencyDepartures;
   final bool hasFrequencyTripsWithoutStopTimes;
 
@@ -79,35 +106,26 @@ class GtfsDataset {
   static Future<GtfsDataset> fromZip(
     List<int> bytes, {
     required String sourceName,
-  }) async {
-    final files = <String, String>{};
-    try {
-      final archive = ZipDecoder().decodeBytes(bytes);
-      for (final file in archive.files) {
-        if (!file.isFile) continue;
-        final name = file.name.replaceAll('\\', '/').split('/').last;
-        if (const {
-          'agency.txt',
-          'routes.txt',
-          'stops.txt',
-          'trips.txt',
-          'stop_times.txt',
-          'frequencies.txt',
-        }.contains(name)) {
-          files[name] = utf8.decode(file.content, allowMalformed: false);
-        }
-      }
-    } on FormatException {
-      rethrow;
-    } catch (error) {
-      throw FormatException('Could not read this ZIP file: $error');
-    }
-    return fromFiles(files, sourceName: sourceName);
+    GtfsColumnMappings columnMappings = const {},
+  }) {
+    return compute(
+      _parseZipInBackground,
+      _GtfsZipImportRequest(
+        bytes: bytes,
+        sourceName: sourceName,
+        columnMappings: columnMappings,
+      ),
+    );
+  }
+
+  static Future<GtfsFeedPreview> inspectZip(List<int> bytes) {
+    return compute(_inspectZipInBackground, bytes);
   }
 
   static GtfsDataset fromFiles(
     Map<String, String> files, {
     required String sourceName,
+    GtfsColumnMappings columnMappings = const {},
   }) {
     for (final name in ['routes.txt', 'stops.txt', 'trips.txt']) {
       if (!files.containsKey(name)) {
@@ -121,15 +139,58 @@ class GtfsDataset {
       );
     }
 
-    final routeRows = _readCsv(files['routes.txt']!, 'routes.txt');
-    final stopRows = _readCsv(files['stops.txt']!, 'stops.txt');
-    final tripRows = _readCsv(files['trips.txt']!, 'trips.txt');
+    final routeRows = _readCsv(
+      files['routes.txt']!,
+      'routes.txt',
+      columnMappings['routes.txt'] ?? const {},
+    );
+    final stopRows = _readCsv(
+      files['stops.txt']!,
+      'stops.txt',
+      columnMappings['stops.txt'] ?? const {},
+    );
+    final tripRows = _readCsv(
+      files['trips.txt']!,
+      'trips.txt',
+      columnMappings['trips.txt'] ?? const {},
+    );
     final stopTimeRows = files['stop_times.txt'] == null
         ? <Map<String, String>>[]
-        : _readCsv(files['stop_times.txt']!, 'stop_times.txt');
+        : _readCsv(
+            files['stop_times.txt']!,
+            'stop_times.txt',
+            columnMappings['stop_times.txt'] ?? const {},
+          );
     final frequencyRows = files['frequencies.txt'] == null
         ? <Map<String, String>>[]
-        : _readCsv(files['frequencies.txt']!, 'frequencies.txt');
+        : _readCsv(
+            files['frequencies.txt']!,
+            'frequencies.txt',
+            columnMappings['frequencies.txt'] ?? const {},
+          );
+    final calendarRows = files['calendar.txt'] == null
+        ? <Map<String, String>>[]
+        : _readCsv(
+            files['calendar.txt']!,
+            'calendar.txt',
+            columnMappings['calendar.txt'] ?? const {},
+          );
+    final serviceDaysByServiceId = <String, String>{};
+    for (final row in calendarRows) {
+      final serviceId = row['service_id'] ?? '';
+      if (serviceId.isEmpty) continue;
+      final activeDays = <String>[];
+      for (final day in _calendarDays) {
+        final value = row[day.$1] ?? '';
+        if (value != '0' && value != '1') {
+          throw FormatException(
+            'calendar.txt has an invalid ${day.$1} value for service $serviceId.',
+          );
+        }
+        if (value == '1') activeDays.add(day.$2);
+      }
+      serviceDaysByServiceId[serviceId] = _formatServiceDays(activeDays);
+    }
     final routes = <String, _RouteRecord>{};
     for (final row in routeRows) {
       final id = row['route_id'] ?? '';
@@ -250,6 +311,8 @@ class GtfsDataset {
     final stopSequenceByRouteAndFirstStop =
         <String, Map<String, Map<String, int>>>{};
     final startCountsByRoute = <String, Map<String, int>>{};
+    final stopSequencesByRoute = <String, Map<String, RouteStopSequence>>{};
+    final tripCountsBySequenceKey = <String, Map<String, int>>{};
     final departuresByRoute = <String, List<_DepartureRecord>>{};
     final routeIdsByStopId = <String, Set<String>>{};
     for (final entry in stopTimesByTrip.entries) {
@@ -258,6 +321,25 @@ class GtfsDataset {
         ..sort((a, b) => a.sequence.compareTo(b.sequence));
       if (orderedTimes.isEmpty) continue;
       final firstStop = orderedTimes.first.stopId;
+      final tripStopIds = orderedTimes.map((time) => time.stopId).toList();
+      final sequenceKey = tripStopIds.join('\u001f');
+      stopSequencesByRoute
+          .putIfAbsent(routeId, () => {})
+          .putIfAbsent(
+            sequenceKey,
+            () => RouteStopSequence(
+              startStopId: tripStopIds.first,
+              endStopId: tripStopIds.last,
+              stopIds: tripStopIds,
+            ),
+          );
+      tripCountsBySequenceKey
+          .putIfAbsent(routeId, () => {})
+          .update(
+        sequenceKey,
+        (count) => count + 1,
+        ifAbsent: () => 1,
+      );
       final sequence = stopSequenceByRoute.putIfAbsent(routeId, () => {});
       final sequenceByFirstStop = stopSequenceByRouteAndFirstStop
           .putIfAbsent(routeId, () => {})
@@ -316,7 +398,7 @@ class GtfsDataset {
         }
         for (
           var seconds = frequency.startSeconds;
-          seconds < frequency.endSeconds;
+          seconds <= frequency.endSeconds;
           seconds += frequency.headwaySeconds
         ) {
           departuresByRoute
@@ -409,10 +491,40 @@ class GtfsDataset {
           color: route.color,
           textColor: route.textColor,
           stopIds: orderedStopIds,
+          stopSequences:
+              (stopSequencesByRoute[route.id]?.values.map((sequence) {
+                    final sequenceKey = sequence.stopIds.join('\u001f');
+                    return RouteStopSequence(
+                      startStopId: sequence.startStopId,
+                      endStopId: sequence.endStopId,
+                      stopIds: sequence.stopIds,
+                      tripCount:
+                          tripCountsBySequenceKey[route.id]?[sequenceKey] ?? 1,
+                    );
+                  }).toList() ??
+                  [])
+                ..sort((a, b) {
+              if (a.startStopId == primaryFirstStop &&
+                  b.startStopId != primaryFirstStop) {
+                return -1;
+              }
+              if (b.startStopId == primaryFirstStop &&
+                  a.startStopId != primaryFirstStop) {
+                return 1;
+              }
+              final startComparison = a.startStopId.compareTo(b.startStopId);
+              if (startComparison != 0) return startComparison;
+              return a.endStopId.compareTo(b.endStopId);
+            }),
           firstStopId:
               primaryFirstStop ??
               (orderedStopIds.isEmpty ? '' : orderedStopIds.first),
           departureTimesByServiceId: orderedDepartureTimesByServiceId,
+          serviceDaysByServiceId: {
+            for (final serviceId in orderedDepartureTimesByServiceId.keys)
+              if (serviceDaysByServiceId.containsKey(serviceId))
+                serviceId: serviceDaysByServiceId[serviceId]!,
+          },
           hasEstimatedFrequencyDepartures: routesWithEstimatedFrequencies
               .contains(route.id),
           hasFrequencyTripsWithoutStopTimes:
@@ -436,7 +548,11 @@ class GtfsDataset {
       });
     final agencyRows = files['agency.txt'] == null
         ? <Map<String, String>>[]
-        : _readCsv(files['agency.txt']!, 'agency.txt');
+        : _readCsv(
+            files['agency.txt']!,
+            'agency.txt',
+            columnMappings['agency.txt'] ?? const {},
+          );
     final agencyName = agencyRows.isEmpty
         ? ''
         : (agencyRows.first['agency_name'] ?? '').trim();
@@ -454,19 +570,34 @@ class GtfsDataset {
   }
 }
 
-List<Map<String, String>> _readCsv(String source, String filename) {
+List<Map<String, String>> _readCsv(
+  String source,
+  String filename, [
+  Map<String, int> columnMappings = const {},
+]) {
   try {
-    final rows = const CsvToListConverter(shouldParseNumbers: false)
-        .convert(source);
+    final rows = _convertCsv(source);
     if (rows.isEmpty) {
       throw const FormatException('The file is empty.');
     }
-    final headers = rows.first
+    final sourceHeaders = rows.first
         .map((value) => value.toString().replaceFirst('\uFEFF', '').trim())
         .toList();
+    final fieldIndexes = <String, int>{};
+    for (final entry in columnMappings.entries) {
+      if (entry.value < 0 || entry.value >= sourceHeaders.length) {
+        throw FormatException(
+          '$filename has no column ${entry.value + 1} for ${entry.key}.',
+        );
+      }
+      fieldIndexes[entry.key] = entry.value;
+    }
+    for (final field in _usedHeaders(filename)) {
+      fieldIndexes.putIfAbsent(field, () => sourceHeaders.indexOf(field));
+    }
     final requiredHeaders = _requiredHeaders(filename);
     final missingHeaders = requiredHeaders
-        .where((header) => !headers.contains(header))
+        .where((header) => (fieldIndexes[header] ?? -1) < 0)
         .toList();
     if (missingHeaders.isNotEmpty) {
       throw FormatException(
@@ -474,15 +605,15 @@ List<Map<String, String>> _readCsv(String source, String filename) {
       );
     }
     if (filename == 'routes.txt' &&
-        !headers.contains('route_short_name') &&
-        !headers.contains('route_long_name')) {
+        (fieldIndexes['route_short_name'] ?? -1) < 0 &&
+        (fieldIndexes['route_long_name'] ?? -1) < 0) {
       throw const FormatException(
         'routes.txt must include route_short_name or route_long_name.',
       );
     }
     if (filename == 'stop_times.txt' &&
-        !headers.contains('arrival_time') &&
-        !headers.contains('departure_time')) {
+        (fieldIndexes['arrival_time'] ?? -1) < 0 &&
+        (fieldIndexes['departure_time'] ?? -1) < 0) {
       throw const FormatException(
         'stop_times.txt must include arrival_time or departure_time.',
       );
@@ -491,8 +622,9 @@ List<Map<String, String>> _readCsv(String source, String filename) {
       for (final row in rows.skip(1))
         if (row.any((value) => value.toString().trim().isNotEmpty))
           {
-            for (var i = 0; i < headers.length && i < row.length; i++)
-              headers[i]: row[i].toString().trim(),
+            for (final entry in fieldIndexes.entries)
+              if (entry.value >= 0 && entry.value < row.length)
+                entry.key: row[entry.value].toString().trim(),
           },
     ];
   } on FormatException {
@@ -502,14 +634,177 @@ List<Map<String, String>> _readCsv(String source, String filename) {
   }
 }
 
+Map<String, String> _decodeZipFiles(List<int> bytes) {
+  final files = <String, String>{};
+  try {
+    final archive = ZipDecoder().decodeBytes(bytes);
+    for (final file in archive.files) {
+      if (!file.isFile) continue;
+      final name = file.name.replaceAll('\\', '/').split('/').last;
+      if (const {
+        'agency.txt',
+        'calendar.txt',
+        'routes.txt',
+        'stops.txt',
+        'trips.txt',
+        'stop_times.txt',
+        'frequencies.txt',
+      }.contains(name)) {
+        files[name] = utf8.decode(file.content, allowMalformed: false);
+      }
+    }
+  } on FormatException {
+    rethrow;
+  } catch (error) {
+    throw FormatException('Could not read this ZIP file: $error');
+  }
+  return files;
+}
+
+List<String> _csvHeaders(String source, String filename) {
+  try {
+    final rows = _convertCsv(_firstCsvRecord(source));
+    if (rows.isEmpty) return const [];
+    return rows.first
+        .map((value) => value.toString().replaceFirst('\uFEFF', '').trim())
+        .toList();
+  } on FormatException {
+    rethrow;
+  } catch (error) {
+    throw FormatException('Could not inspect $filename: $error');
+  }
+}
+
+List<List<dynamic>> _convertCsv(String source) {
+  final normalizedSource = source
+      .replaceAll('\r\n', '\n')
+      .replaceAll('\r', '\n');
+  return const CsvToListConverter(
+    shouldParseNumbers: false,
+    eol: '\n',
+  ).convert(normalizedSource);
+}
+
+String _firstCsvRecord(String source) {
+  var insideQuotedField = false;
+  for (var i = 0; i < source.length; i++) {
+    final character = source[i];
+    if (character == '"') {
+      if (insideQuotedField && i + 1 < source.length && source[i + 1] == '"') {
+        i++;
+      } else {
+        insideQuotedField = !insideQuotedField;
+      }
+    } else if (!insideQuotedField && (character == '\n' || character == '\r')) {
+      return source.substring(0, i);
+    }
+  }
+  return source;
+}
+
+GtfsFeedPreview _inspectZipInBackground(List<int> bytes) {
+  final files = _decodeZipFiles(bytes);
+  return GtfsFeedPreview({
+    for (final entry in files.entries)
+      entry.key: _csvHeaders(entry.value, entry.key),
+  });
+}
+
+GtfsDataset _parseZipInBackground(_GtfsZipImportRequest request) {
+  return GtfsDataset.fromFiles(
+    _decodeZipFiles(request.bytes),
+    sourceName: request.sourceName,
+    columnMappings: request.columnMappings,
+  );
+}
+
+class _GtfsZipImportRequest {
+  const _GtfsZipImportRequest({
+    required this.bytes,
+    required this.sourceName,
+    required this.columnMappings,
+  });
+
+  final List<int> bytes;
+  final String sourceName;
+  final GtfsColumnMappings columnMappings;
+}
+
 Set<String> _requiredHeaders(String filename) => switch (filename) {
   'routes.txt' => {'route_id', 'route_type'},
   'stops.txt' => {'stop_id', 'stop_name'},
   'trips.txt' => {'route_id', 'service_id', 'trip_id'},
   'stop_times.txt' => {'trip_id', 'stop_id', 'stop_sequence'},
   'frequencies.txt' => {'trip_id', 'start_time', 'end_time', 'headway_secs'},
+  'calendar.txt' => {'service_id', for (final day in _calendarDays) day.$1},
   _ => {'agency_name'},
 };
+
+Set<String> _usedHeaders(String filename) => switch (filename) {
+  'routes.txt' => {
+    'route_id',
+    'route_short_name',
+    'route_long_name',
+    'route_desc',
+    'route_type',
+    'route_color',
+    'route_text_color',
+  },
+  'stops.txt' => {
+    'stop_id',
+    'stop_name',
+    'stop_code',
+    'stop_desc',
+    'stop_lat',
+    'stop_lon',
+  },
+  'trips.txt' => {'route_id', 'service_id', 'trip_id'},
+  'stop_times.txt' => {
+    'trip_id',
+    'stop_id',
+    'stop_sequence',
+    'arrival_time',
+    'departure_time',
+  },
+  'frequencies.txt' => {
+    'trip_id',
+    'start_time',
+    'end_time',
+    'headway_secs',
+    'exact_times',
+  },
+  'calendar.txt' => {'service_id', for (final day in _calendarDays) day.$1},
+  _ => {'agency_name'},
+};
+
+const _calendarDays = [
+  ('monday', 'Monday'),
+  ('tuesday', 'Tuesday'),
+  ('wednesday', 'Wednesday'),
+  ('thursday', 'Thursday'),
+  ('friday', 'Friday'),
+  ('saturday', 'Saturday'),
+  ('sunday', 'Sunday'),
+];
+
+String _formatServiceDays(List<String> days) {
+  if (days.length == 7) return 'Every day';
+  if (days.length == 5 &&
+      days.take(5).join(', ') ==
+          const [
+            'Monday',
+            'Tuesday',
+            'Wednesday',
+            'Thursday',
+            'Friday',
+          ].join(', ')) {
+    return 'Monday to Friday';
+  }
+  if (days.length == 2 && days.join(', ') == 'Saturday, Sunday') {
+    return 'Saturday and Sunday';
+  }
+  return days.isEmpty ? 'No days scheduled' : days.join(', ');
+}
 
 int? _timeInSeconds(String time) {
   final parts = time.split(':');

@@ -34,3 +34,19 @@ OUTSTANDING ISSUES:
 FUTURE IMPLEMENTATION:
 
 (1) track which stop have/have not printed for. save data as exportable csv and import user data each app launch? 
+
+-----
+
+10 Oct 2026 3:58 PM
+
+1. instead of filling cells in grey, just changed text colour to light grey for passed stops (no cell colour filling)
+
+2. need alternative for cell colour filling for current stop to... to save ink 
+
+3. for stop codes, instead of changing font size, increase stop code column width/decrease stop column width
+
+4. implement a generating message pop up to avoid user trying to click around the app and the app hanging while PDF generates 
+
+5.a. parsing the stop_times for list of stops and sequence has issue - last stop not pulling through 
+
+5.b. parse through the stop_times for list of stops but keep in consideration trip_id to split list of stops depending on direction of travel. 

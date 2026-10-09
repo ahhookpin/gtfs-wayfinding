@@ -4,102 +4,117 @@ import 'package:printing/printing.dart';
 
 import 'gtfs_data.dart';
 
+enum StopPosterLayout { combined, separateRoutes }
+
 class PosterService {
   static Future<void> printStop({
     required TransitStop stop,
     required List<TransitRoute> routes,
+    required List<TransitStop> allStops,
     required String agencyName,
+    required StopPosterLayout layout,
+    required Future<void> Function() onPdfGenerated,
   }) async {
     final document = pw.Document();
-    document.addPage(
-      pw.MultiPage(
-        pageFormat: PdfPageFormat.a4,
-        margin: const pw.EdgeInsets.all(38),
-        header: (context) => _header(agencyName),
-        footer: (context) => _footer(context),
-        build: (context) => [
-          _eyebrow('STOP INFORMATION'),
-          pw.SizedBox(height: 8),
-          pw.Text(
-            stop.name,
-            style: pw.TextStyle(
-              fontSize: 30,
-              fontWeight: pw.FontWeight.bold,
-              color: PdfColor.fromHex('#102A43'),
-            ),
-          ),
-          if (stop.code.isNotEmpty)
-            pw.Padding(
-              padding: const pw.EdgeInsets.only(top: 7),
-              child: pw.Text(
-                'Stop code  ${stop.code}',
-                style: pw.TextStyle(
-                  fontSize: 11,
-                  color: PdfColor.fromHex('#526777'),
+    final stopById = {for (final item in allStops) item.id: item};
+    final sharedRoutesByStopId = _sharedRoutesByStopId(routes);
+
+    if (routes.isEmpty) {
+      document.addPage(
+        pw.MultiPage(
+          pageFormat: PdfPageFormat.a4,
+          margin: const pw.EdgeInsets.all(38),
+          //header: (context) => _header(agencyName),
+          footer: (context) => _footer(context),
+          build: (context) => [
+            ..._stopHeading(stop),
+            _emptyMessage('No routes are listed for this stop.'),
+          ],
+        ),
+      );
+    } else if (layout == StopPosterLayout.combined) {
+      document.addPage(
+        pw.MultiPage(
+          pageFormat: PdfPageFormat.a4,
+          margin: const pw.EdgeInsets.all(38),
+          //header: (context) => _header(agencyName),
+          footer: (context) => _footer(context),
+          build: (context) => [
+            ..._stopHeading(stop),
+            _eyebrow('COMBINED ROUTE GUIDE · ${routes.length} ROUTES'),
+            pw.SizedBox(height: 12),
+            for (final route in routes) ...[
+              ..._routeHeading(route),
+              for (final sequence in _sequencesForRoute(
+                route,
+                stopById,
+                currentStopId: stop.id,
+              )) ...[
+                _directionHeading(sequence),
+                _routeStopsTable(
+                  sequence,
+                  currentStopId: stop.id,
+                  sharedRoutesByStopId: sharedRoutesByStopId,
                 ),
-              ),
-            ),
-          pw.SizedBox(height: 24),
-          _sectionTitle('Routes serving this stop', routes.length),
-          pw.SizedBox(height: 10),
-          if (routes.isEmpty)
-            _emptyMessage('No routes are listed for this stop.')
-          else
-            pw.Table(
-              border: pw.TableBorder(
-                horizontalInside: pw.BorderSide(
-                  color: PdfColor.fromHex('#E5EBEF'),
-                  width: 0.7,
-                ),
-              ),
-              columnWidths: {
-                0: const pw.FixedColumnWidth(90),
-                1: const pw.FlexColumnWidth(2),
-                2: const pw.FlexColumnWidth(1),
-              },
-              children: [
-                _tableHeader(['ROUTE', 'DESTINATION / NAME', 'SERVICE']),
-                for (final route in routes)
-                  pw.TableRow(
-                    verticalAlignment: pw.TableCellVerticalAlignment.middle,
-                    children: [
-                      _tableCell(
-                        route.shortName.isEmpty ? route.id : route.shortName,
-                        bold: true,
-                      ),
-                      _tableCell(
-                        route.longName.isEmpty
-                            ? route.description
-                            : route.longName,
-                      ),
-                      _tableCell(_routeType(route.type)),
-                    ],
-                  ),
+                pw.SizedBox(height: 12),
               ],
-            ),
-        ],
-      ),
-    );
+            ],
+          ],
+        ),
+      );
+    } else {
+      for (final route in routes) {
+        document.addPage(
+          pw.MultiPage(
+            pageFormat: PdfPageFormat.a4,
+            margin: const pw.EdgeInsets.all(38),
+            //header: (context) => _header(agencyName),
+            footer: (context) => _footer(context),
+            build: (context) => [
+              ..._stopHeading(stop),
+              ..._routeHeading(route),
+              for (final sequence in _sequencesForRoute(
+                route,
+                stopById,
+                currentStopId: stop.id,
+              )) ...[
+                _directionHeading(sequence),
+                _routeStopsTable(
+                  sequence,
+                  currentStopId: stop.id,
+                  sharedRoutesByStopId: sharedRoutesByStopId,
+                ),
+              ],
+            ],
+          ),
+        );
+      }
+    }
+    final pdfBytes = await document.save();
+    await onPdfGenerated();
     await Printing.layoutPdf(
-      name: 'stop-${_safeName(stop.name)}.pdf',
-      onLayout: (_) => document.save(),
+      name: 'stop-${_safeName(stop.name)}-routes.pdf',
+      onLayout: (_) async => pdfBytes,
     );
   }
 
   static Future<void> printRoute({
     required TransitRoute route,
-    required List<TransitStop> stops,
+    required List<TransitStop> allStops,
     required String agencyName,
+    required Future<void> Function() onPdfGenerated,
   }) async {
     final document = pw.Document();
+    final stopById = {for (final stop in allStops) stop.id: stop};
+    final sequences = _sequencesForRoute(route, stopById);
     document.addPage(
       pw.MultiPage(
         pageFormat: PdfPageFormat.a4,
         margin: const pw.EdgeInsets.all(38),
-        header: (context) => _header(agencyName),
+        //header: (context) => _header(agencyName),
         footer: (context) => _footer(context),
         build: (context) {
-          final firstStops = stops.where(
+          final firstStops = allStops.where(
             (stop) => stop.id == route.firstStopId,
           );
           final firstStopName = firstStops.isEmpty
@@ -113,7 +128,7 @@ class PosterService {
               style: pw.TextStyle(
                 fontSize: 34,
                 fontWeight: pw.FontWeight.bold,
-                color: PdfColor.fromHex('#102A43'),
+                color: PdfColor.fromHex('#000000'),
               ),
             ),
             if (route.longName.isNotEmpty && route.longName != route.shortName)
@@ -123,44 +138,35 @@ class PosterService {
                   route.longName,
                   style: pw.TextStyle(
                     fontSize: 15,
-                    color: PdfColor.fromHex('#526777'),
+                    color: PdfColor.fromHex('#444444'),
                   ),
                 ),
               ),
             pw.SizedBox(height: 21),
-            _sectionTitle('Stops along this route', stops.length),
+            _sectionTitle(
+              'Stops along this route',
+              sequences.fold<int>(
+                0,
+                (count, sequence) => count + sequence.length,
+              ),
+            ),
             pw.SizedBox(height: 10),
           ];
-          if (stops.isEmpty) {
+          if (sequences.isEmpty) {
             content.add(_emptyMessage('No stops are listed for this route.'));
           } else {
-            content.add(
-              pw.Table(
-                border: pw.TableBorder(
-                  horizontalInside: pw.BorderSide(
-                    color: PdfColor.fromHex('#E5EBEF'),
-                    width: 0.7,
+            for (final sequence in sequences) {
+              content
+                ..add(_directionHeading(sequence))
+                ..add(
+                  _routeStopsTable(
+                    sequence,
+                    currentStopId: null,
+                    sharedRoutesByStopId: const {},
                   ),
-                ),
-                columnWidths: {
-                  0: const pw.FixedColumnWidth(40),
-                  1: const pw.FlexColumnWidth(1),
-                  2: const pw.FixedColumnWidth(100),
-                },
-                children: [
-                  _tableHeader(['#', 'STOP', 'STOP CODE']),
-                  for (var index = 0; index < stops.length; index++)
-                    pw.TableRow(
-                      verticalAlignment: pw.TableCellVerticalAlignment.middle,
-                      children: [
-                        _tableCell('${index + 1}', muted: true),
-                        _tableCell(stops[index].name, bold: index == 0),
-                        _tableCell(stops[index].code, muted: true),
-                      ],
-                    ),
-                ],
-              ),
-            );
+                )
+                ..add(pw.SizedBox(height: 12));
+            }
           }
           content.addAll([
             pw.SizedBox(height: 24),
@@ -178,7 +184,7 @@ class PosterService {
                       : 'Includes estimated frequency-based departure times.',
                   style: pw.TextStyle(
                     fontSize: 9,
-                    color: PdfColor.fromHex('#718492'),
+                    color: PdfColor.fromHex('#555555'),
                   ),
                 ),
               ),
@@ -194,11 +200,12 @@ class PosterService {
                 pw.Padding(
                   padding: const pw.EdgeInsets.only(bottom: 7),
                   child: pw.Text(
-                    'Service ID · ${service.key}',
+                    route.serviceDaysByServiceId[service.key] ??
+                        'Service ID · ${service.key}',
                     style: pw.TextStyle(
                       fontSize: 10,
                       fontWeight: pw.FontWeight.bold,
-                      color: PdfColor.fromHex('#526777'),
+                      color: PdfColor.fromHex('#444444'),
                     ),
                   ),
                 ),
@@ -228,19 +235,278 @@ class PosterService {
         },
       ),
     );
+    final pdfBytes = await document.save();
+    await onPdfGenerated();
     await Printing.layoutPdf(
       name:
           'route-${_safeName(route.shortName.isEmpty ? route.id : route.shortName)}.pdf',
-      onLayout: (_) => document.save(),
+      onLayout: (_) async => pdfBytes,
     );
   }
 
+  static List<pw.Widget> _stopHeading(TransitStop stop) => [
+    pw.SizedBox(height: 8),
+    pw.Text(
+      stop.name,
+      style: pw.TextStyle(fontSize: 28, fontWeight: pw.FontWeight.bold),
+    ),
+    if (stop.code.isNotEmpty)
+      pw.Padding(
+        padding: const pw.EdgeInsets.only(top: 4),
+        child: pw.Text(
+          'STOP CODE · ${stop.code}',
+          style: pw.TextStyle(fontSize: 10, color: PdfColor.fromHex('#555555')),
+        ),
+      ),
+  ];
+
+  static List<pw.Widget> _routeHeading(TransitRoute route) => [
+    pw.SizedBox(height: 8),
+    pw.Text(
+      route.shortName.isEmpty ? route.displayName : route.shortName,
+      style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold),
+    ),
+    if (route.longName.isNotEmpty && route.longName != route.shortName)
+      pw.Padding(
+        padding: const pw.EdgeInsets.only(top: 2, bottom: 7),
+        child: pw.Text(
+          route.longName,
+          style: pw.TextStyle(fontSize: 10, color: PdfColor.fromHex('#444444')),
+        ),
+      ),
+  ];
+
+  static List<List<TransitStop>> _sequencesForRoute(
+    TransitRoute route,
+    Map<String, TransitStop> stopById, {
+    String? currentStopId,
+  }) {
+    final routeSequences = route.stopSequences;
+    final matchingSequences =
+        routeSequences
+            .where((sequence) => sequence.stopIds.contains(currentStopId))
+            .toList()
+          ..sort((a, b) => b.tripCount.compareTo(a.tripCount));
+    final selectedSequences = currentStopId == null
+        ? routeSequences
+        : matchingSequences;
+    final sequences = routeSequences.isEmpty
+        ? [route.stopIds]
+        : currentStopId != null && selectedSequences.isNotEmpty
+        ? [selectedSequences.first.stopIds]
+        : currentStopId != null
+        ? [route.stopIds]
+        : routeSequences.map((sequence) => sequence.stopIds).toList();
+    return [
+      for (final sequence in sequences)
+        [
+          for (final stopId in sequence)
+            if (stopById[stopId] case final stop?) stop,
+        ],
+    ];
+  }
+
+  static pw.Widget _directionHeading(List<TransitStop> stops) {
+    final origin = stops.isEmpty ? 'Unknown origin' : stops.first.name;
+    final destination = stops.isEmpty ? 'Unknown destination' : stops.last.name;
+    return pw.Padding(
+      padding: const pw.EdgeInsets.only(top: 5, bottom: 5),
+      child: pw.Text(
+        '$origin to $destination',
+        style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold),
+      ),
+    );
+  }
+
+  static Map<String, String> _sharedRoutesByStopId(List<TransitRoute> routes) {
+    final routeNamesByStop = <String, Set<String>>{};
+    for (final route in routes) {
+      final routeName = route.shortName.isEmpty ? route.id : route.shortName;
+      for (final sequence in route.stopSequences) {
+        for (final stopId in sequence.stopIds) {
+          routeNamesByStop.putIfAbsent(stopId, () => {}).add(routeName);
+        }
+      }
+      if (route.stopSequences.isEmpty) {
+        for (final stopId in route.stopIds) {
+          routeNamesByStop.putIfAbsent(stopId, () => {}).add(routeName);
+        }
+      }
+    }
+    return {
+      for (final entry in routeNamesByStop.entries)
+        if (entry.value.length > 1)
+          entry.key: (entry.value.toList()..sort()).join(', '),
+    };
+  }
+
+  static pw.Table _routeStopsTable(
+    List<TransitStop> stops, {
+    required String? currentStopId,
+    required Map<String, String> sharedRoutesByStopId,
+  }) => pw.Table(
+    border: pw.TableBorder(
+      horizontalInside: pw.BorderSide(
+        color: PdfColor.fromHex('#BBBBBB'),
+        width: 0.6,
+      ),
+    ),
+    columnWidths: {
+      0: const pw.FixedColumnWidth(34),
+      1: const pw.FlexColumnWidth(1),
+      2: const pw.FixedColumnWidth(150),
+    },
+    children: _routeStopsTableRows(
+      stops,
+      currentStopId: currentStopId,
+      sharedRoutesByStopId: sharedRoutesByStopId,
+    ),
+  );
+
+  static List<pw.TableRow> _routeStopsTableRows(
+    List<TransitStop> stops, {
+    required String? currentStopId,
+    required Map<String, String> sharedRoutesByStopId,
+  }) {
+    final currentIndex = stops.indexWhere((stop) => stop.id == currentStopId);
+    return [
+      _tableHeader(['#', 'STOP', 'STOP CODE']),
+      for (var index = 0; index < stops.length; index++)
+        _routeStopRow(
+          stops[index],
+          index: index,
+          currentIndex: currentIndex,
+          isLast: index == stops.length - 1,
+          sharedRouteNames: sharedRoutesByStopId[stops[index].id] ?? '',
+        ),
+    ];
+  }
+
+  static pw.TableRow _routeStopRow(
+    TransitStop stop, {
+    required int index,
+    required int currentIndex,
+    required bool isLast,
+    required String sharedRouteNames,
+  }) {
+    final isCurrent = index == currentIndex;
+    final isPassed = currentIndex >= 0 && index < currentIndex;
+    const background = PdfColor.fromInt(0xFFFFFFFF);
+    final foreground = isPassed
+        ? PdfColor.fromHex('#AAAAAA')
+        : PdfColor.fromHex('#111111');
+    return pw.TableRow(
+      verticalAlignment: pw.TableCellVerticalAlignment.middle,
+      children: [
+        _routeStopCell(
+          '${index + 1}',
+          background: background,
+          foreground: foreground,
+          bold: isCurrent,
+        ),
+        pw.Container(
+          padding: const pw.EdgeInsets.symmetric(vertical: 7, horizontal: 6),
+          decoration: pw.BoxDecoration(
+            color: background,
+            border: isCurrent
+                ? pw.Border(
+                    top: pw.BorderSide(
+                      color: PdfColor.fromHex('#000000'),
+                      width: 1.8,
+                    ),
+                    right: pw.BorderSide(
+                      color: PdfColor.fromHex('#000000'),
+                      width: 2,
+                    ),
+                    bottom: pw.BorderSide(
+                      color: PdfColor.fromHex('#000000'),
+                      width: 1.8,
+                    ),
+                    left: pw.BorderSide(
+                      color: PdfColor.fromHex('#000000'),
+                      width: 1.8,
+                    ),
+                  )
+                : null,
+          ),
+          child: pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.start,
+            children: [
+              pw.Text(
+                stop.name,
+                style: pw.TextStyle(
+                  fontSize: 9,
+                  fontWeight: isCurrent
+                      ? pw.FontWeight.bold
+                      : pw.FontWeight.normal,
+                  color: foreground,
+                ),
+              ),
+              if (isCurrent || isPassed)
+                pw.Text(
+                  isCurrent ? 'YOU ARE HERE' : 'PASSED',
+                  style: pw.TextStyle(
+                    fontSize: 7,
+                    fontWeight: pw.FontWeight.bold,
+                    color: foreground,
+                  ),
+                ),
+              if (isLast)
+                pw.Text(
+                  isCurrent ? 'YOU ARE HERE · LAST STOP' : 'LAST STOP',
+                  style: pw.TextStyle(
+                    fontSize: 7,
+                    fontWeight: pw.FontWeight.bold,
+                    color: foreground,
+                  ),
+                ),
+              if (sharedRouteNames.isNotEmpty)
+                pw.Text(
+                  'SHARED BY $sharedRouteNames',
+                  style: pw.TextStyle(fontSize: 6, color: foreground),
+                ),
+            ],
+          ),
+        ),
+        pw.Container(
+          color: background,
+          padding: const pw.EdgeInsets.symmetric(vertical: 7, horizontal: 4),
+          alignment: pw.Alignment.centerLeft,
+          child: pw.Text(
+            stop.code,
+            softWrap: true,
+            style: pw.TextStyle(fontSize: 9, color: foreground),
+          ),
+        ),
+      ],
+    );
+  }
+
+  static pw.Widget _routeStopCell(
+    String text, {
+    required PdfColor background,
+    required PdfColor foreground,
+    bool bold = false,
+  }) => pw.Container(
+    color: background,
+    padding: const pw.EdgeInsets.symmetric(vertical: 7, horizontal: 6),
+    child: pw.Text(
+      text,
+      style: pw.TextStyle(
+        fontSize: 9,
+        fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
+        color: foreground,
+      ),
+    ),
+  );
+
+  /*
   static pw.Widget _header(String agencyName) => pw.Container(
     padding: const pw.EdgeInsets.only(bottom: 11),
     margin: const pw.EdgeInsets.only(bottom: 24),
     decoration: pw.BoxDecoration(
       border: pw.Border(
-        bottom: pw.BorderSide(color: PdfColor.fromHex('#DDE5E9')),
+        bottom: pw.BorderSide(color: PdfColor.fromHex('#777777')),
       ),
     ),
     child: pw.Row(
@@ -251,28 +517,29 @@ class PosterService {
           style: pw.TextStyle(
             fontSize: 9,
             fontWeight: pw.FontWeight.bold,
-            color: PdfColor.fromHex('#147D5A'),
+            color: PdfColor.fromHex('#000000'),
             letterSpacing: 1.1,
           ),
         ),
         pw.Text(
           'SERVICE INFORMATION',
-          style: pw.TextStyle(fontSize: 8, color: PdfColor.fromHex('#718492')),
+          style: pw.TextStyle(fontSize: 8, color: PdfColor.fromHex('#555555')),
         ),
       ],
     ),
   );
+  */
 
   static pw.Widget _footer(pw.Context context) => pw.Container(
     alignment: pw.Alignment.centerRight,
     padding: const pw.EdgeInsets.only(top: 10),
     margin: const pw.EdgeInsets.only(top: 18),
     decoration: pw.BoxDecoration(
-      border: pw.Border(top: pw.BorderSide(color: PdfColor.fromHex('#DDE5E9'))),
+      border: pw.Border(top: pw.BorderSide(color: PdfColor.fromHex('#777777'))),
     ),
     child: pw.Text(
-      'PAGE ${context.pageNumber}  ·  PRINT AT A4 SIZE',
-      style: pw.TextStyle(fontSize: 8, color: PdfColor.fromHex('#718492')),
+      'PAGE ${context.pageNumber}  ·  Guerilla Wayfinding',
+      style: pw.TextStyle(fontSize: 8, color: PdfColor.fromHex('#555555')),
     ),
   );
 
@@ -281,7 +548,7 @@ class PosterService {
     style: pw.TextStyle(
       fontSize: 9,
       fontWeight: pw.FontWeight.bold,
-      color: PdfColor.fromHex('#147D5A'),
+      color: PdfColor.fromHex('#000000'),
       letterSpacing: 1.2,
     ),
   );
@@ -294,7 +561,7 @@ class PosterService {
           style: pw.TextStyle(
             fontSize: 17,
             fontWeight: pw.FontWeight.bold,
-            color: PdfColor.fromHex('#102A43'),
+            color: PdfColor.fromHex('#000000'),
           ),
         ),
       ),
@@ -303,7 +570,7 @@ class PosterService {
         style: pw.TextStyle(
           fontSize: 8,
           fontWeight: pw.FontWeight.bold,
-          color: PdfColor.fromHex('#718492'),
+          color: PdfColor.fromHex('#555555'),
         ),
       ),
     ],
@@ -319,39 +586,23 @@ class PosterService {
             style: pw.TextStyle(
               fontSize: 8,
               fontWeight: pw.FontWeight.bold,
-              color: PdfColor.fromHex('#718492'),
+              color: PdfColor.fromHex('#555555'),
             ),
           ),
         ),
     ],
   );
 
-  static pw.Widget _tableCell(
-    String text, {
-    bool bold = false,
-    bool muted = false,
-  }) => pw.Padding(
-    padding: const pw.EdgeInsets.symmetric(vertical: 10, horizontal: 7),
-    child: pw.Text(
-      text,
-      style: pw.TextStyle(
-        fontSize: 10,
-        fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
-        color: PdfColor.fromHex(muted ? '#718492' : '#102A43'),
-      ),
-    ),
-  );
-
   static pw.Widget _emptyMessage(String text) => pw.Container(
     width: double.infinity,
     padding: const pw.EdgeInsets.all(16),
     decoration: pw.BoxDecoration(
-      color: PdfColor.fromHex('#F2F6F5'),
+      color: PdfColor.fromHex('#EEEEEE'),
       borderRadius: pw.BorderRadius.circular(7),
     ),
     child: pw.Text(
       text,
-      style: pw.TextStyle(fontSize: 10, color: PdfColor.fromHex('#526777')),
+      style: pw.TextStyle(fontSize: 10, color: PdfColor.fromHex('#333333')),
     ),
   );
 
@@ -360,8 +611,8 @@ class PosterService {
     child: pw.Container(
       height: 34,
       decoration: pw.BoxDecoration(
-        color: PdfColor.fromHex('#E9F6F1'),
-        borderRadius: pw.BorderRadius.circular(6),
+        color: PdfColor.fromHex('#FFFFFF'),
+        border: pw.Border.all(color: PdfColor.fromHex('#000000'), width: 0.8),
       ),
       child: pw.Center(
         child: pw.Text(
@@ -369,24 +620,12 @@ class PosterService {
           style: pw.TextStyle(
             fontSize: 11,
             fontWeight: pw.FontWeight.bold,
-            color: PdfColor.fromHex('#147D5A'),
+            color: PdfColor.fromHex('#000000'),
           ),
         ),
       ),
     ),
   );
-
-  static String _routeType(String type) => switch (type) {
-    '0' => 'Tram',
-    '1' => 'Metro',
-    '2' => 'Rail',
-    '3' => 'Bus',
-    '4' => 'Ferry',
-    '5' => 'Cable tram',
-    '6' => 'Gondola',
-    '7' => 'Funicular',
-    _ => 'Other service',
-  };
 
   static String _safeName(String value) =>
       value.replaceAll(RegExp(r'[^a-zA-Z0-9_-]+'), '-');
