@@ -161,8 +161,8 @@ class _TransitHomePageState extends State<TransitHomePage> {
         builder: (context) => AlertDialog(
           title: const Text('Stop poster layout'),
           content: const Text(
-            'Choose whether routes share a continuous guide or start on '
-            'separate A4 pages. Each route keeps its own stop sequence.',
+            'Choose a combined guide, separate route pages, or a view that '
+            'shows only this stop and the stops ahead.',
           ),
           actions: [
             TextButton(
@@ -170,16 +170,19 @@ class _TransitHomePageState extends State<TransitHomePage> {
               child: const Text('Cancel'),
             ),
             OutlinedButton(
-              onPressed: () => Navigator.of(
-                context,
-              ).pop(StopPosterLayout.combined),
+              onPressed: () =>
+                  Navigator.of(context).pop(StopPosterLayout.combined),
               child: const Text('Combined routes'),
             ),
-            FilledButton(
-              onPressed: () => Navigator.of(
-                context,
-              ).pop(StopPosterLayout.separateRoutes),
+            TextButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(StopPosterLayout.separateRoutes),
               child: const Text('Separate by route'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(StopPosterLayout.currentAndNext),
+              child: const Text('Current + next stops'),
             ),
           ],
         ),

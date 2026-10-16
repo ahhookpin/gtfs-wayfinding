@@ -44,6 +44,30 @@ class RouteStopSequence {
   final int tripCount;
 }
 
+class StopServiceOperatingTimes {
+  const StopServiceOperatingTimes({
+    this.firstArrivalSeconds,
+    this.latestScheduledDepartureSeconds,
+    this.latestScheduledTravelSeconds,
+    this.firstFrequencyDepartureSeconds,
+    this.lastFrequencyDepartureSeconds,
+    this.frequencyTravelSeconds,
+    this.minimumFrequencyHeadwaySeconds,
+    this.maximumFrequencyHeadwaySeconds,
+    this.headwayIsEstimated = false,
+  });
+
+  final int? firstArrivalSeconds;
+  final int? latestScheduledDepartureSeconds;
+  final int? latestScheduledTravelSeconds;
+  final int? firstFrequencyDepartureSeconds;
+  final int? lastFrequencyDepartureSeconds;
+  final int? frequencyTravelSeconds;
+  final int? minimumFrequencyHeadwaySeconds;
+  final int? maximumFrequencyHeadwaySeconds;
+  final bool headwayIsEstimated;
+}
+
 class TransitRoute {
   const TransitRoute({
     required this.id,
@@ -55,6 +79,7 @@ class TransitRoute {
     required this.firstStopId,
     required this.departureTimesByServiceId,
     required this.serviceDaysByServiceId,
+    required this.stopOperatingTimesByStopId,
     required this.hasEstimatedFrequencyDepartures,
     required this.hasFrequencyTripsWithoutStopTimes,
     this.description = '',
@@ -74,6 +99,8 @@ class TransitRoute {
   final String firstStopId;
   final Map<String, List<String>> departureTimesByServiceId;
   final Map<String, String> serviceDaysByServiceId;
+  final Map<String, Map<String, Map<String, StopServiceOperatingTimes>>>
+  stopOperatingTimesByStopId;
   final bool hasEstimatedFrequencyDepartures;
   final bool hasFrequencyTripsWithoutStopTimes;
 
@@ -335,11 +362,7 @@ class GtfsDataset {
           );
       tripCountsBySequenceKey
           .putIfAbsent(routeId, () => {})
-          .update(
-        sequenceKey,
-        (count) => count + 1,
-        ifAbsent: () => 1,
-      );
+          .update(sequenceKey, (count) => count + 1, ifAbsent: () => 1);
       final sequence = stopSequenceByRoute.putIfAbsent(routeId, () => {});
       final sequenceByFirstStop = stopSequenceByRouteAndFirstStop
           .putIfAbsent(routeId, () => {})
@@ -409,6 +432,7 @@ class GtfsDataset {
                   serviceId: serviceIdByTripId[entry.key]!,
                   time: _formatGtfsTime(seconds),
                   seconds: seconds,
+                  isFrequency: true,
                 ),
               );
         }
@@ -481,6 +505,14 @@ class GtfsDataset {
         for (final serviceId in departureTimesByServiceId.keys.toList()..sort())
           serviceId: departureTimesByServiceId[serviceId]!,
       };
+      final stopOperatingTimesByStopId = _stopOperatingTimesForRoute(
+        routeId: route.id,
+        stopTimesByTrip: stopTimesByTrip,
+        routeIdByTripId: routeIdByTripId,
+        serviceIdByTripId: serviceIdByTripId,
+        frequenciesByTripId: frequenciesByTripId,
+        departures: departuresByRoute[route.id] ?? const [],
+      );
       transitRoutes.add(
         TransitRoute(
           id: route.id,
@@ -493,29 +525,32 @@ class GtfsDataset {
           stopIds: orderedStopIds,
           stopSequences:
               (stopSequencesByRoute[route.id]?.values.map((sequence) {
-                    final sequenceKey = sequence.stopIds.join('\u001f');
-                    return RouteStopSequence(
-                      startStopId: sequence.startStopId,
-                      endStopId: sequence.endStopId,
-                      stopIds: sequence.stopIds,
-                      tripCount:
-                          tripCountsBySequenceKey[route.id]?[sequenceKey] ?? 1,
-                    );
-                  }).toList() ??
-                  [])
+                      final sequenceKey = sequence.stopIds.join('\u001f');
+                      return RouteStopSequence(
+                        startStopId: sequence.startStopId,
+                        endStopId: sequence.endStopId,
+                        stopIds: sequence.stopIds,
+                        tripCount:
+                            tripCountsBySequenceKey[route.id]?[sequenceKey] ??
+                            1,
+                      );
+                    }).toList() ??
+                    [])
                 ..sort((a, b) {
-              if (a.startStopId == primaryFirstStop &&
-                  b.startStopId != primaryFirstStop) {
-                return -1;
-              }
-              if (b.startStopId == primaryFirstStop &&
-                  a.startStopId != primaryFirstStop) {
-                return 1;
-              }
-              final startComparison = a.startStopId.compareTo(b.startStopId);
-              if (startComparison != 0) return startComparison;
-              return a.endStopId.compareTo(b.endStopId);
-            }),
+                  if (a.startStopId == primaryFirstStop &&
+                      b.startStopId != primaryFirstStop) {
+                    return -1;
+                  }
+                  if (b.startStopId == primaryFirstStop &&
+                      a.startStopId != primaryFirstStop) {
+                    return 1;
+                  }
+                  final startComparison = a.startStopId.compareTo(
+                    b.startStopId,
+                  );
+                  if (startComparison != 0) return startComparison;
+                  return a.endStopId.compareTo(b.endStopId);
+                }),
           firstStopId:
               primaryFirstStop ??
               (orderedStopIds.isEmpty ? '' : orderedStopIds.first),
@@ -525,6 +560,7 @@ class GtfsDataset {
               if (serviceDaysByServiceId.containsKey(serviceId))
                 serviceId: serviceDaysByServiceId[serviceId]!,
           },
+          stopOperatingTimesByStopId: stopOperatingTimesByStopId,
           hasEstimatedFrequencyDepartures: routesWithEstimatedFrequencies
               .contains(route.id),
           hasFrequencyTripsWithoutStopTimes:
@@ -806,6 +842,166 @@ String _formatServiceDays(List<String> days) {
   return days.isEmpty ? 'No days scheduled' : days.join(', ');
 }
 
+Map<String, Map<String, Map<String, StopServiceOperatingTimes>>>
+_stopOperatingTimesForRoute({
+  required String routeId,
+  required Map<String, List<_StopTimeRecord>> stopTimesByTrip,
+  required Map<String, String> routeIdByTripId,
+  required Map<String, String> serviceIdByTripId,
+  required Map<String, List<_FrequencyRecord>> frequenciesByTripId,
+  required List<_DepartureRecord> departures,
+}) {
+  final timesByStopAndService =
+      <String, Map<String, Map<String, _StopOperatingTimesBuilder>>>{};
+  final frequencyDeparturesByHubAndService = <String, Map<String, List<int>>>{};
+  final scheduledDeparturesByHubAndService = <String, Map<String, Set<int>>>{};
+  for (final departure in departures) {
+    if (!departure.isFrequency || departure.seconds == null) {
+      continue;
+    }
+    frequencyDeparturesByHubAndService
+        .putIfAbsent(departure.stopId, () => {})
+        .putIfAbsent(departure.serviceId, () => [])
+        .add(departure.seconds!);
+  }
+
+  for (final entry in stopTimesByTrip.entries) {
+    if (routeIdByTripId[entry.key] != routeId) continue;
+    final serviceId = serviceIdByTripId[entry.key] ?? '';
+    final stopTimes = entry.value
+      ..sort((a, b) => a.sequence.compareTo(b.sequence));
+    if (stopTimes.isEmpty) continue;
+
+    final firstStop = stopTimes.first;
+    final startTime = firstStop.departureTime.isNotEmpty
+        ? firstStop.departureTime
+        : firstStop.arrivalTime;
+    final startSeconds = _timeInSeconds(startTime);
+    final isFrequencyTrip = frequenciesByTripId.containsKey(entry.key);
+    for (final stopTime in stopTimes) {
+      final builder = timesByStopAndService
+          .putIfAbsent(stopTime.stopId, () => {})
+          .putIfAbsent(firstStop.stopId, () => {})
+          .putIfAbsent(serviceId, _StopOperatingTimesBuilder.new);
+      final arrivalSeconds = _timeInSeconds(stopTime.arrivalTime);
+      if (isFrequencyTrip) {
+        if (startSeconds != null &&
+            arrivalSeconds != null &&
+            builder.frequencyTravelSeconds == null) {
+          builder.frequencyTravelSeconds = stopTime.stopId == firstStop.stopId
+              ? 0
+              : arrivalSeconds - startSeconds;
+        }
+        for (final frequency in frequenciesByTripId[entry.key]!) {
+          final currentMinimum = builder.minimumFrequencyHeadwaySeconds;
+          final currentMaximum = builder.maximumFrequencyHeadwaySeconds;
+          builder
+            ..minimumFrequencyHeadwaySeconds =
+                currentMinimum == null ||
+                    frequency.headwaySeconds < currentMinimum
+                ? frequency.headwaySeconds
+                : currentMinimum
+            ..maximumFrequencyHeadwaySeconds =
+                currentMaximum == null ||
+                    frequency.headwaySeconds > currentMaximum
+                ? frequency.headwaySeconds
+                : currentMaximum;
+        }
+        continue;
+      }
+      if (stopTime.stopId == firstStop.stopId && startSeconds != null) {
+        scheduledDeparturesByHubAndService
+            .putIfAbsent(firstStop.stopId, () => {})
+            .putIfAbsent(serviceId, () => <int>{})
+            .add(startSeconds);
+      }
+      if (arrivalSeconds != null &&
+          (builder.firstArrivalSeconds == null ||
+              arrivalSeconds < builder.firstArrivalSeconds!)) {
+        builder.firstArrivalSeconds = arrivalSeconds;
+      }
+      if (startSeconds == null || arrivalSeconds == null) continue;
+      if (builder.latestScheduledDepartureSeconds == null ||
+          startSeconds > builder.latestScheduledDepartureSeconds!) {
+        builder
+          ..latestScheduledDepartureSeconds = startSeconds
+          ..latestScheduledTravelSeconds = stopTime.stopId == firstStop.stopId
+              ? 0
+              : arrivalSeconds - startSeconds;
+      }
+    }
+  }
+
+  return {
+    for (final stopEntry in timesByStopAndService.entries)
+      stopEntry.key: {
+        for (final hubEntry in stopEntry.value.entries)
+          hubEntry.key: {
+            for (final serviceEntry in hubEntry.value.entries)
+              serviceEntry.key: () {
+                final frequencyDepartures =
+                    frequencyDeparturesByHubAndService[hubEntry
+                        .key]?[serviceEntry.key] ??
+                    const <int>[];
+                final orderedFrequencyDepartures = frequencyDepartures.toList()
+                  ..sort();
+                final scheduledDepartures =
+                    scheduledDeparturesByHubAndService[hubEntry
+                            .key]?[serviceEntry.key]
+                        ?.toList() ??
+                    <int>[];
+                scheduledDepartures.sort();
+                final scheduledHeadways = [
+                  for (
+                    var index = 1;
+                    index < scheduledDepartures.length;
+                    index++
+                  )
+                    scheduledDepartures[index] - scheduledDepartures[index - 1],
+                ]..removeWhere((headway) => headway <= 0);
+                final inferredHeadway =
+                    frequenciesByTripId.isEmpty && scheduledHeadways.isNotEmpty
+                    ? (
+                        minimum: scheduledHeadways.reduce(
+                          (a, b) => a < b ? a : b,
+                        ),
+                        maximum: scheduledHeadways.reduce(
+                          (a, b) => a > b ? a : b,
+                        ),
+                      )
+                    : null;
+                return StopServiceOperatingTimes(
+                  firstArrivalSeconds:
+                      serviceEntry.value.firstArrivalSeconds ??
+                      (orderedFrequencyDepartures.isEmpty ||
+                              serviceEntry.value.frequencyTravelSeconds == null
+                          ? null
+                          : orderedFrequencyDepartures.first +
+                                serviceEntry.value.frequencyTravelSeconds!),
+                  latestScheduledDepartureSeconds:
+                      serviceEntry.value.latestScheduledDepartureSeconds,
+                  latestScheduledTravelSeconds:
+                      serviceEntry.value.latestScheduledTravelSeconds,
+                  firstFrequencyDepartureSeconds:
+                      orderedFrequencyDepartures.firstOrNull,
+                  lastFrequencyDepartureSeconds:
+                      orderedFrequencyDepartures.lastOrNull,
+                  frequencyTravelSeconds:
+                      serviceEntry.value.frequencyTravelSeconds,
+                  minimumFrequencyHeadwaySeconds:
+                      serviceEntry.value.minimumFrequencyHeadwaySeconds ??
+                      inferredHeadway?.minimum,
+                  maximumFrequencyHeadwaySeconds:
+                      serviceEntry.value.maximumFrequencyHeadwaySeconds ??
+                      inferredHeadway?.maximum,
+                  headwayIsEstimated: inferredHeadway != null,
+                );
+              }(),
+          },
+      },
+  };
+}
+
 int? _timeInSeconds(String time) {
   final parts = time.split(':');
   if (parts.length != 3) return null;
@@ -823,6 +1019,16 @@ int? _timeInSeconds(String time) {
     return null;
   }
   return hours * 3600 + minutes * 60 + seconds;
+}
+
+class _StopOperatingTimesBuilder {
+  int? firstArrivalSeconds;
+  int? latestScheduledDepartureSeconds;
+  int? latestScheduledTravelSeconds;
+  int? frequencyTravelSeconds;
+  int? minimumFrequencyHeadwaySeconds;
+  int? maximumFrequencyHeadwaySeconds;
+  bool headwayIsEstimated = false;
 }
 
 String _formatGtfsTime(int seconds) {
@@ -874,12 +1080,14 @@ class _DepartureRecord {
     required this.serviceId,
     required this.time,
     required this.seconds,
+    this.isFrequency = false,
   });
 
   final String stopId;
   final String serviceId;
   final String time;
   final int? seconds;
+  final bool isFrequency;
 }
 
 class _FrequencyRecord {

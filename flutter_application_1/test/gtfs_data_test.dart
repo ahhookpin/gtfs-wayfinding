@@ -43,6 +43,117 @@ void main() {
     expect(dataset.routeIdsByStopId['s2'], ['r1']);
   });
 
+  test(
+    'estimates frequency from scheduled departures without frequencies.txt',
+    () {
+      final scheduledOnlyFiles = {
+        ...files,
+        'trips.txt':
+            'route_id,service_id,trip_id\r\n'
+            'r1,weekday,t1\r\n'
+            'r1,weekday,t2\r\n'
+            'r1,weekday,t3\r\n',
+        'stop_times.txt':
+            'trip_id,arrival_time,departure_time,stop_id,stop_sequence\r\n'
+            't1,08:00:00,08:00:00,s1,1\r\n'
+            't1,08:10:00,08:10:00,s2,2\r\n'
+            't2,08:15:00,08:15:00,s1,1\r\n'
+            't2,08:25:00,08:25:00,s2,2\r\n'
+            't3,09:00:00,09:00:00,s1,1\r\n'
+            't3,09:10:00,09:10:00,s2,2\r\n',
+      };
+
+      final dataset = GtfsDataset.fromFiles(
+        scheduledOnlyFiles,
+        sourceName: 'scheduled-only.zip',
+      );
+      final stopTimes = dataset
+          .routes
+          .single
+          .stopOperatingTimesByStopId['s2']!['s1']!['weekday']!;
+
+      expect(stopTimes.minimumFrequencyHeadwaySeconds, 15 * 60);
+      expect(stopTimes.maximumFrequencyHeadwaySeconds, 45 * 60);
+      expect(stopTimes.headwayIsEstimated, isTrue);
+    },
+  );
+
+  test('estimates stop operating hours from scheduled and frequency trips', () {
+    final operatingHoursFiles = {
+      ...files,
+      'trips.txt':
+          'route_id,service_id,trip_id\r\n'
+          'r1,weekday,t1\r\n'
+          'r1,weekday,t2\r\n'
+          'r1,weekday,frequency-trip\r\n',
+      'stop_times.txt':
+          'trip_id,arrival_time,departure_time,stop_id,stop_sequence\r\n'
+          't1,08:00:00,08:00:00,s1,1\r\n'
+          't1,08:20:00,08:20:00,s2,2\r\n'
+          't2,09:00:00,09:00:00,s1,1\r\n'
+          't2,09:30:00,09:30:00,s2,2\r\n'
+          'frequency-trip,10:00:00,10:00:00,s1,1\r\n'
+          'frequency-trip,10:24:00,10:24:00,s2,2\r\n',
+      'frequencies.txt':
+          'trip_id,start_time,end_time,headway_secs,exact_times\r\n'
+          'frequency-trip,10:00:00,10:25:00,600,0\r\n'
+          'frequency-trip,10:00:00,10:25:00,900,0\r\n',
+    };
+
+    final dataset = GtfsDataset.fromFiles(
+      operatingHoursFiles,
+      sourceName: 'operating-hours.zip',
+    );
+    final stopTimes = dataset
+        .routes
+        .single
+        .stopOperatingTimesByStopId['s2']!['s1']!['weekday']!;
+
+    expect(stopTimes.firstArrivalSeconds, 8 * 3600 + 20 * 60);
+    expect(stopTimes.latestScheduledDepartureSeconds, 9 * 3600);
+    expect(stopTimes.latestScheduledTravelSeconds, 30 * 60);
+    expect(stopTimes.firstFrequencyDepartureSeconds, 10 * 3600);
+    expect(stopTimes.lastFrequencyDepartureSeconds, 10 * 3600 + 20 * 60);
+    expect(stopTimes.minimumFrequencyHeadwaySeconds, 600);
+    expect(stopTimes.maximumFrequencyHeadwaySeconds, 900);
+    expect(stopTimes.headwayIsEstimated, isFalse);
+  });
+
+  test(
+    'uses frequency template travel offsets when no scheduled trips exist',
+    () {
+      final frequencyOnlyFiles = {
+        ...files,
+        'trips.txt':
+            'route_id,service_id,trip_id\r\n'
+            'r1,weekday,frequency-trip\r\n',
+        'stop_times.txt':
+            'trip_id,arrival_time,departure_time,stop_id,stop_sequence\r\n'
+            'frequency-trip,06:15:00,06:15:00,s1,1\r\n'
+            'frequency-trip,06:35:00,06:35:00,s2,2\r\n',
+        'frequencies.txt':
+            'trip_id,start_time,end_time,headway_secs,exact_times\r\n'
+            'frequency-trip,06:00:00,07:00:00,1800,0\r\n',
+      };
+
+      final dataset = GtfsDataset.fromFiles(
+        frequencyOnlyFiles,
+        sourceName: 'frequency-only.zip',
+      );
+      final stopTimes = dataset
+          .routes
+          .single
+          .stopOperatingTimesByStopId['s2']!['s1']!['weekday']!;
+
+      expect(stopTimes.firstArrivalSeconds, 6 * 3600 + 20 * 60);
+      expect(stopTimes.frequencyTravelSeconds, 20 * 60);
+      expect(stopTimes.firstFrequencyDepartureSeconds, 6 * 3600);
+      expect(stopTimes.lastFrequencyDepartureSeconds, 7 * 3600);
+      expect(stopTimes.minimumFrequencyHeadwaySeconds, 1800);
+      expect(stopTimes.maximumFrequencyHeadwaySeconds, 1800);
+    },
+  );
+
   test('maps renamed feed columns to the fields used by the app', () {
     final renamedFiles = {
       'routes.txt':

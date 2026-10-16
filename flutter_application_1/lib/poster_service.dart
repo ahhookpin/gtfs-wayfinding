@@ -4,7 +4,7 @@ import 'package:printing/printing.dart';
 
 import 'gtfs_data.dart';
 
-enum StopPosterLayout { combined, separateRoutes }
+enum StopPosterLayout { combined, separateRoutes, currentAndNext }
 
 class PosterService {
   static Future<void> printStop({
@@ -62,6 +62,32 @@ class PosterService {
           ],
         ),
       );
+    } else if (layout == StopPosterLayout.currentAndNext) {
+      for (final route in routes) {
+        final sequences = _sequencesForRoute(
+          route,
+          stopById,
+          currentStopId: stop.id,
+        );
+        document.addPage(
+          pw.MultiPage(
+            pageFormat: PdfPageFormat.a4,
+            margin: const pw.EdgeInsets.all(38),
+            footer: (context) => _footer(context),
+            build: (context) => [
+              ..._stopHeading(stop),
+              ..._routeHeading(route),
+              for (final sequence in sequences)
+                ..._currentAndNextSequence(
+                  route: route,
+                  sequence: sequence,
+                  currentStopId: stop.id,
+                  sharedRoutesByStopId: sharedRoutesByStopId,
+                ),
+            ],
+          ),
+        );
+      }
     } else {
       for (final route in routes) {
         document.addPage(
@@ -254,7 +280,8 @@ class PosterService {
       pw.Padding(
         padding: const pw.EdgeInsets.only(top: 4),
         child: pw.Text(
-          'STOP CODE · ${stop.code}',
+          //'STOP CODE · ${stop.code}',
+          '${stop.code}',
           style: pw.TextStyle(fontSize: 10, color: PdfColor.fromHex('#555555')),
         ),
       ),
@@ -266,6 +293,7 @@ class PosterService {
       route.shortName.isEmpty ? route.displayName : route.shortName,
       style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold),
     ),
+    /*
     if (route.longName.isNotEmpty && route.longName != route.shortName)
       pw.Padding(
         padding: const pw.EdgeInsets.only(top: 2, bottom: 7),
@@ -274,6 +302,7 @@ class PosterService {
           style: pw.TextStyle(fontSize: 10, color: PdfColor.fromHex('#444444')),
         ),
       ),
+    */
   ];
 
   static List<List<TransitStop>> _sequencesForRoute(
@@ -306,13 +335,176 @@ class PosterService {
     ];
   }
 
+  static List<pw.Widget> _currentAndNextSequence({
+    required TransitRoute route,
+    required List<TransitStop> sequence,
+    required String currentStopId,
+    required Map<String, String> sharedRoutesByStopId,
+  }) {
+    final currentIndex = sequence.indexWhere(
+      (stop) => stop.id == currentStopId,
+    );
+    final forwardStops = currentIndex < 0
+        ? <TransitStop>[]
+        : sequence.skip(currentIndex).toList();
+    return [
+      _directionHeading(forwardStops),
+      _posterSectionHeading('Estimated operating hours from here'),
+      _routeOperatingHoursTable(
+        route,
+        currentStopId,
+        sequence.isEmpty ? null : sequence.first.id,
+      ),
+      pw.SizedBox(height: 10),
+      _posterSectionHeading('Stops'),
+      _routeStopsTable(
+        forwardStops,
+        currentStopId: currentStopId,
+        sharedRoutesByStopId: sharedRoutesByStopId,
+      ),
+      pw.SizedBox(height: 12),
+    ];
+  }
+
+  static pw.Widget _posterSectionHeading(String title) => pw.Container(
+    width: double.infinity,
+    padding: const pw.EdgeInsets.symmetric(vertical: 6, horizontal: 7),
+    margin: const pw.EdgeInsets.only(bottom: 2),
+    color: PdfColor.fromHex('#F3F4F4'),
+    child: pw.Text(
+      title,
+      style: pw.TextStyle(
+        fontSize: 9,
+        fontWeight: pw.FontWeight.bold,
+        color: PdfColor.fromHex('#333333'),
+      ),
+    ),
+  );
+
+  static pw.Widget _routeOperatingHoursTable(
+    TransitRoute route,
+    String stopId,
+    String? startingStopId,
+  ) {
+    final serviceTimes = startingStopId == null
+        ? null
+        : route.stopOperatingTimesByStopId[stopId]?[startingStopId];
+    final services = serviceTimes?.entries.toList() ?? const [];
+    return pw.Table(
+      border: pw.TableBorder(
+        horizontalInside: pw.BorderSide(
+          color: PdfColor.fromHex('#BBBBBB'),
+          width: 0.6,
+        ),
+      ),
+      columnWidths: {
+        0: const pw.FlexColumnWidth(2),
+        1: const pw.FlexColumnWidth(1.2),
+        2: const pw.FlexColumnWidth(1),
+        3: const pw.FlexColumnWidth(1),
+      },
+      children: [
+        _tableHeader(['', 'FREQUENCY', 'START TIME', 'END TIME']),
+        if (services.isEmpty)
+          _operatingHoursTableRow(
+            'Not available in this feed',
+            null,
+            null,
+            null,
+            null,
+            false,
+          ),
+        for (final service in services)
+          () {
+            final times = service.value;
+            final lastHubDeparture =
+                times.lastFrequencyDepartureSeconds ??
+                times.latestScheduledDepartureSeconds;
+            final travelTime = times.lastFrequencyDepartureSeconds == null
+                ? times.latestScheduledTravelSeconds
+                : times.latestScheduledTravelSeconds ??
+                      times.frequencyTravelSeconds;
+            final endTime = lastHubDeparture == null || travelTime == null
+                ? null
+                : lastHubDeparture + travelTime;
+            return _operatingHoursTableRow(
+              route.serviceDaysByServiceId[service.key] ??
+                  'Service ID · ${service.key}',
+              times.minimumFrequencyHeadwaySeconds,
+              times.maximumFrequencyHeadwaySeconds,
+              times.firstArrivalSeconds,
+              endTime,
+              times.headwayIsEstimated,
+            );
+          }(),
+      ],
+    );
+  }
+
+  static pw.TableRow _operatingHoursTableRow(
+    String serviceName,
+    int? minimumHeadwaySeconds,
+    int? maximumHeadwaySeconds,
+    int? startTime,
+    int? endTime,
+    bool headwayIsEstimated,
+  ) => pw.TableRow(
+    children: [
+      for (final value in [
+        serviceName,
+        _formatHeadwayRange(
+          minimumHeadwaySeconds,
+          maximumHeadwaySeconds,
+          isEstimated: headwayIsEstimated,
+        ),
+        startTime == null ? 'N/A' : _formatTime(startTime),
+        endTime == null ? 'N/A' : _formatTime(endTime),
+      ])
+        pw.Padding(
+          padding: const pw.EdgeInsets.symmetric(vertical: 6, horizontal: 7),
+          child: pw.Text(
+            value,
+            style: pw.TextStyle(
+              fontSize: 9,
+              color: PdfColor.fromHex('#333333'),
+            ),
+          ),
+        ),
+    ],
+  );
+
+  static String _formatHeadwayRange(
+    int? minimumSeconds,
+    int? maximumSeconds, {
+    required bool isEstimated,
+  }) {
+    if (minimumSeconds == null || maximumSeconds == null) return 'N/A';
+    final minimum = _formatHeadway(minimumSeconds);
+    final range = minimumSeconds == maximumSeconds
+        ? 'Every $minimum'
+        : 'Every $minimum to ${_formatHeadway(maximumSeconds)}';
+    return isEstimated ? '$range' : range;
+  }
+
+  static String _formatHeadway(int seconds) {
+    if (seconds % 60 == 0) return '${seconds ~/ 60} min';
+    return '$seconds sec';
+  }
+
+  static String _formatTime(int seconds) {
+    final hours = seconds ~/ 3600;
+    final minutes = seconds % 3600 ~/ 60;
+    return '${hours.toString().padLeft(2, '0')}:'
+        '${minutes.toString().padLeft(2, '0')}';
+  }
+
   static pw.Widget _directionHeading(List<TransitStop> stops) {
-    final origin = stops.isEmpty ? 'Unknown origin' : stops.first.name;
     final destination = stops.isEmpty ? 'Unknown destination' : stops.last.name;
     return pw.Padding(
       padding: const pw.EdgeInsets.only(top: 5, bottom: 5),
       child: pw.Text(
-        '$origin to $destination',
+        //'$origin to $destination',
+        'to $destination',
         style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold),
       ),
     );
@@ -530,18 +722,27 @@ class PosterService {
   );
   */
 
-  static pw.Widget _footer(pw.Context context) => pw.Container(
-    alignment: pw.Alignment.centerRight,
-    padding: const pw.EdgeInsets.only(top: 10),
-    margin: const pw.EdgeInsets.only(top: 18),
-    decoration: pw.BoxDecoration(
-      border: pw.Border(top: pw.BorderSide(color: PdfColor.fromHex('#777777'))),
-    ),
-    child: pw.Text(
-      'PAGE ${context.pageNumber}  ·  Guerilla Wayfinding',
-      style: pw.TextStyle(fontSize: 8, color: PdfColor.fromHex('#555555')),
-    ),
-  );
+  static pw.Widget _footer(pw.Context context) {
+    final generatedAt = DateTime.now();
+    final generatedDate =
+        '${generatedAt.day.toString().padLeft(2, '0')}/'
+        '${generatedAt.month.toString().padLeft(2, '0')}/'
+        '${generatedAt.year}';
+    return pw.Container(
+      alignment: pw.Alignment.centerRight,
+      padding: const pw.EdgeInsets.only(top: 5), //originally 10
+      margin: const pw.EdgeInsets.only(top: 5), // originally 18
+      decoration: pw.BoxDecoration(
+        border: pw.Border(
+          top: pw.BorderSide(color: PdfColor.fromHex('#777777')),
+        ),
+      ),
+      child: pw.Text(
+        'Generated $generatedDate  ·  PAGE ${context.pageNumber}  ·  Guerilla Wayfinding',
+        style: pw.TextStyle(fontSize: 8, color: PdfColor.fromHex('#555555')),
+      ),
+    );
+  }
 
   static pw.Widget _eyebrow(String text) => pw.Text(
     text,

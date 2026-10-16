@@ -50,3 +50,14 @@ FUTURE IMPLEMENTATION:
 5.a. parsing the stop_times for list of stops and sequence has issue - last stop not pulling through 
 
 5.b. parse through the stop_times for list of stops but keep in consideration trip_id to split list of stops depending on direction of travel. 
+
+
+---------
+
+16 Oct 2026 3:10PM 
+
+MRT Feeder GTFS 
+change route name to route long name
+
+rapidKL
+change stop code to stop_desc
