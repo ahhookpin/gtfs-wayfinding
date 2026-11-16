@@ -68,3 +68,7 @@ flutter run
 ```sh
 flutter test
 ```
+
+## Remarks
+
+We shouldn't support importing multiple GTFS feeds because it is hard to link the 2 different together - there isn't one common field between the 2. Even coordinates (langitutde and longititude) can be off. 

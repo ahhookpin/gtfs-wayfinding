@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'column_mapping_page.dart';
 import 'gtfs_data.dart';
@@ -102,14 +103,15 @@ class _TransitHomePageState extends State<TransitHomePage> {
       final preview = await GtfsDataset.inspectZip(bytes);
       if (!mounted) return;
       setState(() => _isLoading = false);
-      final columnMappings = await Navigator.of(context).push<GtfsColumnMappings>(
-        MaterialPageRoute(
-          builder: (context) => GtfsColumnMappingPage(
-            sourceName: file.name,
-            headersByFile: preview.headersByFile,
-          ),
-        ),
-      );
+      final columnMappings = await Navigator.of(context)
+          .push<GtfsColumnMappings>(
+            MaterialPageRoute(
+              builder: (context) => GtfsColumnMappingPage(
+                sourceName: file.name,
+                headersByFile: preview.headersByFile,
+              ),
+            ),
+          );
       if (!mounted || columnMappings == null) return;
       setState(() => _isLoading = true);
       final dataset = await GtfsDataset.fromZip(
@@ -219,6 +221,30 @@ class _TransitHomePageState extends State<TransitHomePage> {
     } catch (error) {
       if (mounted) {
         _showMessage('Could not create route poster: $error', isError: true);
+      }
+    }
+  }
+
+  Future<void> _printSelectedRouteStops(
+    GtfsDataset dataset,
+    TransitRoute route,
+    List<TransitStop> stops,
+  ) async {
+    if (_isGeneratingPoster || stops.isEmpty) return;
+    try {
+      await _runWithPosterProgress(
+        (onPdfGenerated) => PosterService.printCurrentAndNextStops(
+          stops: stops,
+          route: route,
+          allRoutes: dataset.routes,
+          allStops: dataset.stops,
+          agencyName: dataset.agencyName,
+          onPdfGenerated: onPdfGenerated,
+        ),
+      );
+    } catch (error) {
+      if (mounted) {
+        _showMessage('Could not create stop posters: $error', isError: true);
       }
     }
   }
@@ -437,6 +463,8 @@ class _TransitHomePageState extends State<TransitHomePage> {
                             onSelected: (route) =>
                                 setState(() => _selectedRoute = route),
                             onPrint: (route) => _printRoute(dataset, route),
+                            onPrintSelectedStops: (route, stops) =>
+                                _printSelectedRouteStops(dataset, route, stops),
                           ),
                   ),
                 ],
@@ -815,6 +843,7 @@ class _RoutesWorkspace extends StatelessWidget {
     required this.compact,
     required this.onSelected,
     required this.onPrint,
+    required this.onPrintSelectedStops,
   });
 
   final GtfsDataset dataset;
@@ -822,6 +851,8 @@ class _RoutesWorkspace extends StatelessWidget {
   final bool compact;
   final ValueChanged<TransitRoute> onSelected;
   final ValueChanged<TransitRoute> onPrint;
+  final void Function(TransitRoute route, List<TransitStop> stops)
+  onPrintSelectedStops;
 
   @override
   Widget build(BuildContext context) {
@@ -849,6 +880,8 @@ class _RoutesWorkspace extends StatelessWidget {
             dataset: dataset,
             route: selected,
             onPrint: () => onPrint(selected),
+            onPrintSelectedStops: (stops) =>
+                onPrintSelectedStops(selected, stops),
           );
     if (compact) {
       return Column(
@@ -1222,11 +1255,13 @@ class _RouteDetails extends StatelessWidget {
     required this.dataset,
     required this.route,
     required this.onPrint,
+    required this.onPrintSelectedStops,
   });
 
   final GtfsDataset dataset;
   final TransitRoute route;
   final VoidCallback onPrint;
+  final ValueChanged<List<TransitStop>> onPrintSelectedStops;
 
   @override
   Widget build(BuildContext context) {
@@ -1266,7 +1301,11 @@ class _RouteDetails extends StatelessWidget {
             child: LayoutBuilder(
               builder: (context, constraints) {
                 final narrow = constraints.maxWidth < 540;
-                final stopsPanel = _StopsPanel(stopSequences: stopSequences);
+                final stopsPanel = _StopsPanel(
+                  key: ValueKey(route.id),
+                  stopSequences: stopSequences,
+                  onGeneratePosters: onPrintSelectedStops,
+                );
                 final departuresPanel = _DeparturesPanel(
                   route: route,
                   firstStopName: firstStopName,
@@ -1301,24 +1340,106 @@ class _RouteDetails extends StatelessWidget {
   }
 }
 
-class _StopsPanel extends StatelessWidget {
-  const _StopsPanel({required this.stopSequences});
+class _StopsPanel extends StatefulWidget {
+  const _StopsPanel({
+    super.key,
+    required this.stopSequences,
+    required this.onGeneratePosters,
+  });
 
   final List<List<TransitStop>> stopSequences;
+  final ValueChanged<List<TransitStop>> onGeneratePosters;
+
+  @override
+  State<_StopsPanel> createState() => _StopsPanelState();
+}
+
+class _StopsPanelState extends State<_StopsPanel> {
+  final Set<int> _selectedStopIndexes = {};
+  int? _selectionAnchor;
+
+  void _toggleStop(int index, bool isSelected) {
+    final isShiftPressed = HardwareKeyboard.instance.isShiftPressed;
+    setState(() {
+      final anchor = _selectionAnchor;
+      if (isShiftPressed && anchor != null) {
+        final start = anchor < index ? anchor : index;
+        final end = anchor > index ? anchor : index;
+        for (var rangeIndex = start; rangeIndex <= end; rangeIndex++) {
+          if (isSelected) {
+            _selectedStopIndexes.add(rangeIndex);
+          } else {
+            _selectedStopIndexes.remove(rangeIndex);
+          }
+        }
+      } else {
+        _selectionAnchor = index;
+        if (isSelected) {
+          _selectedStopIndexes.add(index);
+        } else {
+          _selectedStopIndexes.remove(index);
+        }
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
-    final count = stopSequences.fold<int>(
+    final count = widget.stopSequences.fold<int>(
       0,
       (total, sequence) => total + sequence.length,
     );
+    final sequenceOffsets = <int>[];
+    var flattenedStopCount = 0;
+    for (final sequence in widget.stopSequences) {
+      sequenceOffsets.add(flattenedStopCount);
+      flattenedStopCount += sequence.length;
+    }
+    final flattenedStops = [
+      ...widget.stopSequences.expand((sequence) => sequence),
+    ];
+    final selectedStops = [
+      for (final index in _selectedStopIndexes.toList()..sort())
+        flattenedStops.elementAt(index),
+    ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _PanelHeading(title: 'Stops by direction', count: count),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Text(
+              '${selectedStops.length} selected',
+              style: const TextStyle(
+                color: Color(0xFF61747D),
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const Spacer(),
+            FilledButton.icon(
+              onPressed: selectedStops.isEmpty
+                  ? null
+                  : () => widget.onGeneratePosters(selectedStops),
+              icon: const Icon(Icons.picture_as_pdf_outlined, size: 16),
+              label: const Text('Generate current + next'),
+              style: FilledButton.styleFrom(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 11,
+                  vertical: 9,
+                ),
+                textStyle: const TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
         const SizedBox(height: 12),
         Expanded(
-          child: stopSequences.every((sequence) => sequence.isEmpty)
+          child: widget.stopSequences.every((sequence) => sequence.isEmpty)
               ? const _InlineEmpty(
                   message: 'No stops are listed for this route.',
                 )
@@ -1326,18 +1447,16 @@ class _StopsPanel extends StatelessWidget {
                   children: [
                     for (
                       var sequenceIndex = 0;
-                      sequenceIndex < stopSequences.length;
+                      sequenceIndex < widget.stopSequences.length;
                       sequenceIndex++
                     ) ...[
-                      if (stopSequences.length > 1)
+                      if (widget.stopSequences.length > 1 &&
+                          widget.stopSequences[sequenceIndex].isNotEmpty)
                         Padding(
-                          padding: const EdgeInsets.only(
-                            top: 5,
-                            bottom: 10,
-                          ),
+                          padding: const EdgeInsets.only(top: 5, bottom: 10),
                           child: Text(
-                            '${stopSequences[sequenceIndex].first.name} → '
-                            '${stopSequences[sequenceIndex].last.name}',
+                            '${widget.stopSequences[sequenceIndex].first.name} → '
+                            '${widget.stopSequences[sequenceIndex].last.name}',
                             style: const TextStyle(
                               color: Color(0xFF61747D),
                               fontSize: 10,
@@ -1347,17 +1466,22 @@ class _StopsPanel extends StatelessWidget {
                         ),
                       for (
                         var index = 0;
-                        index < stopSequences[sequenceIndex].length;
+                        index < widget.stopSequences[sequenceIndex].length;
                         index++
                       )
                         _stopRow(
-                          stopSequences[sequenceIndex][index],
+                          widget.stopSequences[sequenceIndex][index],
                           index: index,
+                          selectionIndex:
+                              sequenceOffsets[sequenceIndex] + index,
+                          isSelected: _selectedStopIndexes.contains(
+                            sequenceOffsets[sequenceIndex] + index,
+                          ),
                           isLast:
                               index ==
-                              stopSequences[sequenceIndex].length - 1,
+                              widget.stopSequences[sequenceIndex].length - 1,
                         ),
-                      if (sequenceIndex < stopSequences.length - 1)
+                      if (sequenceIndex < widget.stopSequences.length - 1)
                         const Divider(height: 22),
                     ],
                   ],
@@ -1370,6 +1494,8 @@ class _StopsPanel extends StatelessWidget {
   Widget _stopRow(
     TransitStop stop, {
     required int index,
+    required int selectionIndex,
+    required bool isSelected,
     required bool isLast,
   }) => Padding(
     padding: const EdgeInsets.only(bottom: 10),
@@ -1393,9 +1519,7 @@ class _StopsPanel extends StatelessWidget {
                 child: Text(
                   '${index + 1}',
                   style: TextStyle(
-                    color: index == 0
-                        ? Colors.white
-                        : const Color(0xFF61747D),
+                    color: index == 0 ? Colors.white : const Color(0xFF61747D),
                     fontSize: 10,
                     fontWeight: FontWeight.w700,
                   ),
@@ -1449,6 +1573,14 @@ class _StopsPanel extends StatelessWidget {
               ],
             ),
           ),
+        ),
+        Checkbox(
+          value: isSelected,
+          onChanged: (value) {
+            if (value != null) _toggleStop(selectionIndex, value);
+          },
+          visualDensity: VisualDensity.compact,
+          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
         ),
       ],
     ),

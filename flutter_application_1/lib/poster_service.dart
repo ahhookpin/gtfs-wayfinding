@@ -75,8 +75,15 @@ class PosterService {
             margin: const pw.EdgeInsets.all(38),
             footer: (context) => _footer(context),
             build: (context) => [
+              pw.Text(
+                'Perhentian Bas',
+                style: pw.TextStyle(
+                  fontSize: 12,
+                  fontWeight: pw.FontWeight.bold,
+                ),
+              ),
               ..._stopHeading(stop),
-              ..._routeHeading(route),
+              if (sequences.isEmpty) ..._routeHeading(route),
               for (final sequence in sequences)
                 ..._currentAndNextSequence(
                   route: route,
@@ -120,6 +127,74 @@ class PosterService {
     await onPdfGenerated();
     await Printing.layoutPdf(
       name: 'stop-${_safeName(stop.name)}-routes.pdf',
+      onLayout: (_) async => pdfBytes,
+    );
+  }
+
+  static Future<void> printCurrentAndNextStops({
+    required List<TransitStop> stops,
+    required TransitRoute route,
+    required List<TransitRoute> allRoutes,
+    required List<TransitStop> allStops,
+    required String agencyName,
+    required Future<void> Function() onPdfGenerated,
+  }) async {
+    if (stops.isEmpty) {
+      throw ArgumentError.value(
+        stops,
+        'stops',
+        'At least one stop is required.',
+      );
+    }
+
+    final document = pw.Document();
+    final stopById = {for (final stop in allStops) stop.id: stop};
+    for (final stop in stops) {
+      final routesServingCurrentStop = allRoutes
+          .where(
+            (candidate) =>
+                candidate.stopIds.contains(stop.id) ||
+                candidate.stopSequences.any(
+                  (sequence) => sequence.stopIds.contains(stop.id),
+                ),
+          )
+          .toList();
+      final sharedRoutesByStopId = _sharedRoutesByStopId(
+        routesServingCurrentStop,
+      );
+      final sequences = _sequencesForRoute(
+        route,
+        stopById,
+        currentStopId: stop.id,
+      );
+      document.addPage(
+        pw.MultiPage(
+          pageFormat: PdfPageFormat.a4,
+          margin: const pw.EdgeInsets.all(38),
+          footer: (context) => _footer(context),
+          build: (context) => [
+            pw.Text(
+              'Perhentian Bas',
+              style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold),
+            ),
+            ..._stopHeading(stop),
+            if (sequences.isEmpty) ..._routeHeading(route),
+            for (final sequence in sequences)
+              ..._currentAndNextSequence(
+                route: route,
+                sequence: sequence,
+                currentStopId: stop.id,
+                sharedRoutesByStopId: sharedRoutesByStopId,
+              ),
+          ],
+        ),
+      );
+    }
+
+    final pdfBytes = await document.save();
+    await onPdfGenerated();
+    await Printing.layoutPdf(
+      name: 'route-${_safeName(route.displayName)}-current-and-next.pdf',
       onLayout: (_) async => pdfBytes,
     );
   }
@@ -347,16 +422,30 @@ class PosterService {
     final forwardStops = currentIndex < 0
         ? <TransitStop>[]
         : sequence.skip(currentIndex).toList();
+    final routeName = route.shortName.isEmpty
+        ? route.displayName
+        : route.shortName;
+    final destination = forwardStops.isEmpty
+        ? 'Unknown destination'
+        : forwardStops.last.name;
     return [
-      _directionHeading(forwardStops),
-      _posterSectionHeading('Estimated operating hours from here'),
+      pw.Padding(
+        padding: const pw.EdgeInsets.only(top: 5, bottom: 5),
+        child: pw.Text(
+          '$routeName ke $destination',
+          style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold),
+        ),
+      ),
+      _posterSectionHeading(
+        'Estimated operating hours from here / Anggaran waktu operasi dari sini',
+      ),
       _routeOperatingHoursTable(
         route,
         currentStopId,
         sequence.isEmpty ? null : sequence.first.id,
       ),
       pw.SizedBox(height: 10),
-      _posterSectionHeading('Stops'),
+      _posterSectionHeading('Stops / Hentians'),
       _routeStopsTable(
         forwardStops,
         currentStopId: currentStopId,
@@ -398,13 +487,18 @@ class PosterService {
         ),
       ),
       columnWidths: {
-        0: const pw.FlexColumnWidth(2),
-        1: const pw.FlexColumnWidth(1.2),
+        0: const pw.FlexColumnWidth(1),
+        1: const pw.FlexColumnWidth(1),
         2: const pw.FlexColumnWidth(1),
         3: const pw.FlexColumnWidth(1),
       },
       children: [
-        _tableHeader(['', 'FREQUENCY', 'START TIME', 'END TIME']),
+        _tableHeader([
+          '',
+          'FREQUENCY / KEKERAPAN',
+          'START TIME / WAKTU MULA',
+          'END TIME / WAKTU TAMAT',
+        ]),
         if (services.isEmpty)
           _operatingHoursTableRow(
             'Not available in this feed',
@@ -461,7 +555,8 @@ class PosterService {
         endTime == null ? 'N/A' : _formatTime(endTime),
       ])
         pw.Padding(
-          padding: const pw.EdgeInsets.symmetric(vertical: 6, horizontal: 7),
+          //padding set here
+          padding: const pw.EdgeInsets.symmetric(vertical: 3, horizontal: 3),
           child: pw.Text(
             value,
             style: pw.TextStyle(
@@ -588,7 +683,7 @@ class PosterService {
         ? PdfColor.fromHex('#AAAAAA')
         : PdfColor.fromHex('#111111');
     return pw.TableRow(
-      verticalAlignment: pw.TableCellVerticalAlignment.middle,
+      verticalAlignment: pw.TableCellVerticalAlignment.full,
       children: [
         _routeStopCell(
           '${index + 1}',
@@ -597,14 +692,15 @@ class PosterService {
           bold: isCurrent,
         ),
         pw.Container(
-          padding: const pw.EdgeInsets.symmetric(vertical: 7, horizontal: 6),
+          //padding set here
+          padding: const pw.EdgeInsets.symmetric(vertical: 3, horizontal: 3),
           decoration: pw.BoxDecoration(
             color: background,
             border: isCurrent
                 ? pw.Border(
                     top: pw.BorderSide(
                       color: PdfColor.fromHex('#000000'),
-                      width: 1.8,
+                      width: 2,
                     ),
                     right: pw.BorderSide(
                       color: PdfColor.fromHex('#000000'),
@@ -612,11 +708,11 @@ class PosterService {
                     ),
                     bottom: pw.BorderSide(
                       color: PdfColor.fromHex('#000000'),
-                      width: 1.8,
+                      width: 2,
                     ),
                     left: pw.BorderSide(
                       color: PdfColor.fromHex('#000000'),
-                      width: 1.8,
+                      width: 2,
                     ),
                   )
                 : null,
@@ -636,7 +732,7 @@ class PosterService {
               ),
               if (isCurrent || isPassed)
                 pw.Text(
-                  isCurrent ? 'YOU ARE HERE' : 'PASSED',
+                  isCurrent ? 'YOU ARE HERE / ANDA DI SINI' : 'PASSED',
                   style: pw.TextStyle(
                     fontSize: 7,
                     fontWeight: pw.FontWeight.bold,
@@ -645,7 +741,9 @@ class PosterService {
                 ),
               if (isLast)
                 pw.Text(
-                  isCurrent ? 'YOU ARE HERE · LAST STOP' : 'LAST STOP',
+                  isCurrent
+                      ? 'YOU ARE HERE / ANDA DI SINI · LAST STOP'
+                      : 'LAST STOP',
                   style: pw.TextStyle(
                     fontSize: 7,
                     fontWeight: pw.FontWeight.bold,
@@ -662,7 +760,8 @@ class PosterService {
         ),
         pw.Container(
           color: background,
-          padding: const pw.EdgeInsets.symmetric(vertical: 7, horizontal: 4),
+          //paddingset here
+          padding: const pw.EdgeInsets.symmetric(vertical: 3, horizontal: 3),
           alignment: pw.Alignment.centerLeft,
           child: pw.Text(
             stop.code,
@@ -681,7 +780,8 @@ class PosterService {
     bool bold = false,
   }) => pw.Container(
     color: background,
-    padding: const pw.EdgeInsets.symmetric(vertical: 7, horizontal: 6),
+    //padding set here
+    padding: const pw.EdgeInsets.symmetric(vertical: 3, horizontal: 3),
     child: pw.Text(
       text,
       style: pw.TextStyle(
@@ -781,7 +881,8 @@ class PosterService {
     children: [
       for (final label in labels)
         pw.Padding(
-          padding: const pw.EdgeInsets.symmetric(vertical: 8, horizontal: 7),
+          //padding set here
+          padding: const pw.EdgeInsets.symmetric(vertical: 3, horizontal: 3),
           child: pw.Text(
             label,
             style: pw.TextStyle(
